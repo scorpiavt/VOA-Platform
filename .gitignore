@@ -21,3 +21,5 @@ tmp-*.png
 archive-keizaal-removed/
 backup-platform-plugins/
 backup-runtime-deps/
+
+public-release/*.exe
