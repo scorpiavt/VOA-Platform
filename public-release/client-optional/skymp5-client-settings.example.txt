@@ -1,0 +1,7 @@
+{
+  "server-ip": "178.156.158.116",
+  "server-port": 10000,
+  "gameData": {
+    "profileId": 1000
+  }
+}

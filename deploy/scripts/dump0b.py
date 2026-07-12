@@ -1,0 +1,10 @@
+import json
+d = json.load(open("/home/skymp/voa-server/world/changeForms/0.json"))
+print("name", d.get("lookDump", {}).get("name"))
+print("position", d.get("position"))
+print("worldOrCell", d.get("worldOrCell"))
+print("isDisabled", d.get("isDisabled"))
+print("isRaceMenuOpen", d.get("isRaceMenuOpen"))
+print("has lookDump", "lookDump" in d)
+print("has equipmentDump", "equipmentDump" in d)
+print("inv entries", len(d.get("inv", {}).get("entries", [])))

@@ -1,0 +1,102 @@
+{
+  "name": "voa-launcher",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Visions of Aetherius launcher",
+  "author": "Visions of Aetherius",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -p tsconfig.node.json --noEmit && vite build",
+    "build:electron-types": "tsc -p tsconfig.electron.json --noEmit",
+    "preview": "vite preview",
+    "start:electron": "electron .",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder --win portable",
+    "dist:public": "npm run build && electron-builder --win portable",
+    "dist:nsis": "npm run build && electron-builder --win nsis"
+  },
+  "dependencies": {
+    "@voa/shared": "0.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^34.3.0",
+    "electron-builder": "^25.1.8",
+    "rcedit": "^5.0.2",
+    "resedit": "^1.7.2",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.2",
+    "vite-plugin-electron": "^0.29.0",
+    "vite-plugin-electron-renderer": "^0.14.6"
+  },
+  "build": {
+    "appId": "com.visionsofaetherius.launcher",
+    "productName": "VisionsOfAetherius",
+    "copyright": "Visions of Aetherius",
+    "electronVersion": "34.3.0",
+    "afterPack": "./afterPack.js",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "icon": "build/icon.ico",
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "public/hero-art.png",
+      "build/icon.ico",
+      "build/icon.png",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "../../client-dist/skymp5-client.js",
+        "to": "client/skymp5-client.js"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "executableName": "VisionsOfAetherius",
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "VisionsOfAetherius-${version}-portable.${ext}"
+    },
+    "portable": {
+      "artifactName": "VisionsOfAetherius-${version}-portable.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "VisionsOfAetherius-Setup-${version}.${ext}"
+    },
+    "asar": true,
+    "protocols": [
+      {
+        "name": "Visions of Aetherius",
+        "schemes": [
+          "voa"
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=Visions of Aetherius API
+After=network.target
+
+[Service]
+Type=simple
+User=skymp
+WorkingDirectory=/home/skymp/voa-platform/services/api
+Environment=NODE_ENV=production
+EnvironmentFile=/home/skymp/voa-platform/services/api/.env
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

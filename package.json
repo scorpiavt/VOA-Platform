@@ -1,0 +1,24 @@
+{
+  "name": "voa-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Visions of Aetherius — launcher, API, CDN tooling",
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @voa/shared && npm run build -w @voa/api && npm run build -w voa-launcher",
+    "build:shared": "npm run build -w @voa/shared",
+    "build:api": "npm run build -w @voa/shared && npm run build -w @voa/api",
+    "dev:api": "npm run build -w @voa/shared && npm run dev -w @voa/api",
+    "dev:launcher": "npm run build -w @voa/shared && npm run dev -w voa-launcher",
+    "dist:launcher": "npm run build -w @voa/shared && npm run dist -w voa-launcher",
+    "dist:public": "powershell -ExecutionPolicy Bypass -File ./scripts/pack-public-release.ps1",
+    "start:api": "npm run start -w @voa/api"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
