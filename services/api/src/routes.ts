@@ -1,4 +1,6 @@
+import crypto from "crypto";
 import fs from "fs";
+import path from "path";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { nanoid } from "nanoid";
 import { config, discordConfigured } from "./config";
@@ -12,22 +14,63 @@ import {
 } from "./auth";
 import { getDb, type DbUser } from "./db";
 import {
+  bindCharacterActor,
   createCharacter,
   deleteCharacter,
+  getCharacterBindingByProfileSlot,
   getCharacterBySlot,
+  listBindingsForProfile,
   listCharacters,
+  listPendingWipes,
+  markWipesDone,
+  queueOrphanWipes,
+  saveCharacterState,
   touchCharacterPlayed,
   updateCharacterName,
 } from "./characters";
-import { listModPackages, resolvePackageArchive } from "./mods";
+import { getCatalogMeta, listModPackages, resolvePackageArchive } from "./mods";
 import { getServerStatus } from "./status";
 import { getUserById, toPublicUser, upsertDiscordUser } from "./users";
 import {
   assertCommunityMemberAtLogin,
   assertCommunityMemberOngoing,
+  checkStaffAccess,
   membershipErrorHtml,
+  refreshStaffRolesAtLogin,
+  type StaffCheckResult,
 } from "./discordGuild";
-import { getLauncherBinaryPath, readLauncherUpdate } from "./launcherUpdate";
+import {
+  getLauncherBinaryPath,
+  getLauncherCdnFile,
+  readLauncherUpdate,
+} from "./launcherUpdate";
+import {
+  bugReportStats,
+  createBugReport,
+  deleteBugReport,
+  getBugReport,
+  listAllBugReports,
+  listBugReportsForUser,
+  updateBugReportStatus,
+} from "./bugReports";
+import {
+  ackAdminActions,
+  listAdminCharacters,
+  listPendingAdminActions,
+  listUserWarnings,
+  runCharacterAdminAction,
+} from "./adminModeration";
+import {
+  ensureSupportLogsTable,
+  getSupportLogFile,
+  listSupportLogs,
+  listSupportLogsForUser,
+  purgeExpiredSupportLogs,
+  saveSupportLog,
+  SUPPORT_LOG_MAX_BYTES,
+  SUPPORT_LOG_RETENTION_DAYS,
+  toPublicSupportLog,
+} from "./supportLogs";
 
 async function requireUser(req: FastifyRequest): Promise<DbUser> {
   const header = req.headers.authorization;
@@ -51,6 +94,21 @@ async function requireUser(req: FastifyRequest): Promise<DbUser> {
     err.statusCode = 401;
     throw err;
   }
+}
+
+async function requireStaff(
+  req: FastifyRequest
+): Promise<{ user: DbUser; staff: StaffCheckResult }> {
+  const user = await requireUser(req);
+  const staff = await checkStaffAccess(user.discord_id);
+  if (!staff.isStaff) {
+    const err = new Error(
+      "Staff only — requires Founder, Senior Gamemaster, or Gamemaster role"
+    ) as Error & { statusCode: number };
+    err.statusCode = 403;
+    throw err;
+  }
+  return { user, staff };
 }
 
 export async function registerRoutes(app: FastifyInstance): Promise<void> {
@@ -86,9 +144,11 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post("/v1/news", async (req, reply) => {
-    const user = await requireUser(req);
-    if (!config.adminDiscordIds.includes(user.discord_id)) {
-      return reply.code(403).send({ error: "Forbidden" });
+    let user: DbUser;
+    try {
+      ({ user } = await requireStaff(req));
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 403).send({ error: e?.message || "Forbidden" });
     }
     const body = req.body as {
       title?: string;
@@ -116,9 +176,61 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     return { id: Number(info.lastInsertRowid) };
   });
 
-  app.get("/v1/me", async (req, reply) => {
+  app.get("/v1/me", async (req) => {
     const user = await requireUser(req);
-    return { user: toPublicUser(user) };
+    const staff = await checkStaffAccess(user.discord_id);
+    return {
+      user: toPublicUser(user),
+      staff: {
+        isStaff: staff.isStaff,
+        roleIds: staff.roleIds,
+        roleLabels: staff.roleLabels,
+      },
+    };
+  });
+
+  /**
+   * In-game / game-server staff check by session or profileId.
+   * Client uses this to lock console commands to Discord staff roles.
+   */
+  app.get("/v1/game/is-staff", async (req, reply) => {
+    const q = req.query as { session?: string; profileId?: string; secret?: string };
+    const headerSecret = String(req.headers["x-voa-game-secret"] || "").trim();
+    const secret = headerSecret || String(q.secret || "").trim();
+
+    let profileId = Number(q.profileId) || 0;
+    if (q.session) {
+      const row = getDb()
+        .prepare(
+          `SELECT profile_id FROM game_sessions
+           WHERE session_id = ? AND datetime(expires_at) > datetime('now')`
+        )
+        .get(String(q.session)) as { profile_id: number } | undefined;
+      if (!row) return reply.code(401).send({ error: "Invalid session", isStaff: false });
+      profileId = row.profile_id;
+    } else if (secret && secret === config.gameServerSecret && profileId > 0) {
+      // game server trusted lookup by profile
+    } else if (!q.session) {
+      return reply.code(400).send({ error: "session or (secret+profileId) required", isStaff: false });
+    }
+
+    const user = getDb()
+      .prepare(`SELECT * FROM users WHERE profile_id = ?`)
+      .get(profileId) as DbUser | undefined;
+    if (!user) {
+      return { ok: true, isStaff: false, profileId, roles: [] as string[] };
+    }
+    if (user.banned) {
+      return { ok: true, isStaff: false, profileId, roles: [] as string[], banned: true };
+    }
+    const staff = await checkStaffAccess(user.discord_id);
+    return {
+      ok: true,
+      isStaff: staff.isStaff,
+      profileId,
+      roles: staff.roleLabels,
+      method: staff.method,
+    };
   });
 
   app.post("/v1/auth/refresh", async (req, reply) => {
@@ -208,6 +320,333 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     };
   });
 
+  // --- Support logs (opt-in, private storage — not public CDN) ---
+  ensureSupportLogsTable();
+  try {
+    purgeExpiredSupportLogs();
+  } catch {
+    /* ignore */
+  }
+
+  /**
+   * Opt-in support log upload. Requires Discord login + explicit consent:true.
+   * Stored under DATA_DIR/support-logs (staff-only access), auto-expire ~30 days.
+   */
+  app.post("/v1/support/logs", async (req, reply) => {
+    const user = await requireUser(req);
+    const body = (req.body || {}) as {
+      consent?: boolean;
+      consentText?: string;
+      reason?: string;
+      launcherVersion?: string;
+      text?: string;
+    };
+    if (body.consent !== true) {
+      return reply.code(400).send({
+        error: "consent_required",
+        message:
+          "You must set consent:true after reviewing the support-log disclaimer.",
+      });
+    }
+    if (!body.text || typeof body.text !== "string") {
+      return reply.code(400).send({ error: "text required" });
+    }
+    // Soft rate limit: max 5 uploads / hour / user
+    try {
+      const hourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      const recent = getDb()
+        .prepare(
+          `SELECT COUNT(*) AS c FROM support_logs WHERE user_id = ? AND created_at > ?`
+        )
+        .get(user.id, hourAgo) as { c: number };
+      if (recent.c >= 5) {
+        return reply.code(429).send({
+          error: "rate_limited",
+          message: "Max 5 support log uploads per hour.",
+        });
+      }
+    } catch {
+      /* table may race */
+    }
+    try {
+      const saved = saveSupportLog({
+        userId: user.id,
+        profileId: user.profile_id,
+        discordId: user.discord_id,
+        username: user.username,
+        reason: body.reason,
+        launcherVersion: body.launcherVersion,
+        consent: true,
+        text: body.text,
+      });
+      return {
+        ok: true,
+        id: saved.id,
+        sizeBytes: saved.sizeBytes,
+        expiresAt: saved.expiresAt,
+        retentionDays: SUPPORT_LOG_RETENTION_DAYS,
+        maxBytes: SUPPORT_LOG_MAX_BYTES,
+        message:
+          "Support log received. Staff may use it only to diagnose your issue. It is deleted after the retention period.",
+      };
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 500).send({ error: e?.message || String(e) });
+    }
+  });
+
+  /** Current user: their own upload history (metadata only) */
+  app.get("/v1/support/logs/mine", async (req) => {
+    const user = await requireUser(req);
+    return {
+      logs: listSupportLogsForUser(user.id).map((r) => toPublicSupportLog(r, false)),
+      retentionDays: SUPPORT_LOG_RETENTION_DAYS,
+    };
+  });
+
+  /** Staff: list recent support dumps (metadata) */
+  app.get("/v1/support/logs", async (req, reply) => {
+    try {
+      await requireStaff(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 403).send({ error: e?.message || "Staff only" });
+    }
+    purgeExpiredSupportLogs();
+    return {
+      logs: listSupportLogs(100).map((r) => toPublicSupportLog(r, true)),
+      retentionDays: SUPPORT_LOG_RETENTION_DAYS,
+    };
+  });
+
+  /** Staff: download one dump (private; not CDN) */
+  app.get("/v1/support/logs/:id", async (req, reply) => {
+    try {
+      await requireStaff(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 403).send({ error: e?.message || "Staff only" });
+    }
+    const id = Number((req.params as { id: string }).id);
+    const file = getSupportLogFile(id);
+    if (!file) return reply.code(404).send({ error: "Not found or expired" });
+    return {
+      ok: true,
+      meta: toPublicSupportLog(file.row, true),
+      text: file.text,
+    };
+  });
+
+  // --- Bug reports (launcher tab) ---
+
+  app.get("/v1/bug-reports", async (req) => {
+    const user = await requireUser(req);
+    const staff = await checkStaffAccess(user.discord_id);
+    const q = req.query as { all?: string; status?: string };
+    if (staff.isStaff && (q.all === "1" || q.all === "true")) {
+      return {
+        reports: listAllBugReports(200, q.status),
+        admin: true,
+        staffRoles: staff.roleLabels,
+        categories: ["crash", "multiplayer", "launcher", "mods", "character", "other"],
+      };
+    }
+    return {
+      reports: listBugReportsForUser(user.id),
+      admin: staff.isStaff,
+      staffRoles: staff.roleLabels,
+      categories: ["crash", "multiplayer", "launcher", "mods", "character", "other"],
+    };
+  });
+
+  app.post("/v1/bug-reports", async (req, reply) => {
+    const user = await requireUser(req);
+    const body = (req.body || {}) as {
+      title?: string;
+      body?: string;
+      category?: string;
+      launcherVersion?: string;
+      gameVersion?: string;
+      characterSlot?: number | null;
+      characterName?: string | null;
+    };
+    try {
+      const report = createBugReport({
+        userId: user.id,
+        profileId: user.profile_id,
+        title: body.title || "",
+        body: body.body || "",
+        category: body.category,
+        launcherVersion: body.launcherVersion,
+        gameVersion: body.gameVersion,
+        characterSlot: body.characterSlot,
+        characterName: body.characterName,
+      });
+      return { ok: true, report };
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 500).send({ error: e?.message || String(e) });
+    }
+  });
+
+  app.get("/v1/bug-reports/:id", async (req, reply) => {
+    const user = await requireUser(req);
+    const id = Number((req.params as { id: string }).id);
+    const staff = await checkStaffAccess(user.discord_id);
+    const report = getBugReport(id, user.id, staff.isStaff);
+    if (!report) return reply.code(404).send({ error: "Not found" });
+    return { report, admin: staff.isStaff, staffRoles: staff.roleLabels };
+  });
+
+  /** Staff: update status / note (Discord roles: Founder / SGM / GM) */
+  app.patch("/v1/bug-reports/:id", async (req, reply) => {
+    try {
+      await requireStaff(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 403).send({ error: e?.message || "Staff only" });
+    }
+    const id = Number((req.params as { id: string }).id);
+    const body = (req.body || {}) as { status?: string; staffNote?: string | null };
+    try {
+      const report = updateBugReportStatus(id, body.status || "open", body.staffNote);
+      return { ok: true, report };
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 500).send({ error: e?.message || String(e) });
+    }
+  });
+
+  /** Staff: permanently delete a bug report */
+  app.delete("/v1/bug-reports/:id", async (req, reply) => {
+    try {
+      await requireStaff(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 403).send({ error: e?.message || "Staff only" });
+    }
+    const id = Number((req.params as { id: string }).id);
+    try {
+      deleteBugReport(id);
+      return { ok: true };
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 500).send({ error: e?.message || String(e) });
+    }
+  });
+
+  /** Staff: all characters linked to accounts / world actors */
+  app.get("/v1/admin/characters", async (req, reply) => {
+    try {
+      await requireStaff(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 403).send({ error: e?.message || "Staff only" });
+    }
+    const q = req.query as { q?: string; includeEmpty?: string };
+    const characters = listAdminCharacters({
+      q: q.q,
+      includeEmpty: q.includeEmpty === "1" || q.includeEmpty === "true",
+      limit: 1000,
+    });
+    return {
+      ok: true,
+      characters,
+      actions: [
+        "ban",
+        "unban",
+        "warn",
+        "delete_character",
+        "wipe_inventory",
+        "wipe_equipment",
+        "wipe_spells",
+        "wipe_map_markers",
+        "reset_position",
+      ],
+    };
+  });
+
+  /** Staff: moderation action on a character */
+  app.post("/v1/admin/characters/:id/action", async (req, reply) => {
+    let staffUser: DbUser;
+    try {
+      ({ user: staffUser } = await requireStaff(req));
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 403).send({ error: e?.message || "Staff only" });
+    }
+    const id = Number((req.params as { id: string }).id);
+    const body = (req.body || {}) as { action?: string; note?: string };
+    try {
+      const result = runCharacterAdminAction({
+        characterId: id,
+        staffUserId: staffUser.id,
+        action: body.action || "",
+        note: body.note,
+      });
+      return result;
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 500).send({ error: e?.message || String(e) });
+    }
+  });
+
+  app.get("/v1/admin/users/:userId/warnings", async (req, reply) => {
+    try {
+      await requireStaff(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 403).send({ error: e?.message || "Staff only" });
+    }
+    const userId = Number((req.params as { userId: string }).userId);
+    return { ok: true, warnings: listUserWarnings(userId) };
+  });
+
+  /** Game server: pending moderation actions (wipe inv/spells/kick ban, etc.) */
+  app.get("/v1/game/pending-admin-actions", async (req, reply) => {
+    try {
+      requireGameSecret(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 401).send({ error: e?.message || "unauthorized" });
+    }
+    return { ok: true, actions: listPendingAdminActions(100) };
+  });
+
+  app.post("/v1/game/pending-admin-actions/ack", async (req, reply) => {
+    try {
+      requireGameSecret(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 401).send({ error: e?.message || "unauthorized" });
+    }
+    const body = (req.body || {}) as { ids?: number[] };
+    const ids = Array.isArray(body.ids)
+      ? body.ids.map((x) => Number(x)).filter((x) => x > 0)
+      : [];
+    return { ok: true, done: ackAdminActions(ids) };
+  });
+
+  /** Staff dashboard summary */
+  app.get("/v1/admin/summary", async (req, reply) => {
+    let staff: StaffCheckResult;
+    try {
+      ({ staff } = await requireStaff(req));
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 403).send({ error: e?.message || "Staff only" });
+    }
+    const bugs = bugReportStats();
+    const users = getDb()
+      .prepare(`SELECT COUNT(*) AS c FROM users`)
+      .get() as { c: number };
+    const characters = getDb()
+      .prepare(`SELECT COUNT(*) AS c FROM characters WHERE empty = 0 AND deleted = 0`)
+      .get() as { c: number };
+    const status = await getServerStatus();
+    return {
+      ok: true,
+      staffRoles: staff.roleLabels,
+      staffRoleIds: staff.roleIds,
+      bugs,
+      users: Number(users.c || 0),
+      characters: Number(characters.c || 0),
+      server: {
+        gameOnline: status.gameOnline,
+        playersOnline: status.playersOnline,
+        maxPlayers: status.maxPlayers,
+        maintenance: status.maintenance,
+        message: status.message,
+      },
+      recentBugs: listAllBugReports(25, "open"),
+    };
+  });
+
   // --- Characters (2 slots per account) ---
 
   app.get("/v1/characters", async (req) => {
@@ -233,8 +672,15 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     const user = await requireUser(req);
     const { id } = req.params as { id: string };
     try {
-      deleteCharacter(user.id, Number(id));
-      return { ok: true };
+      // Queues SkyMP destroyActor via character_wipes — launcher UI alone is not enough
+      const result = deleteCharacter(user.id, Number(id), user.profile_id);
+      return {
+        ok: true,
+        wipedActorFormId: result.wipedActorFormId,
+        note: result.wipedActorFormId
+          ? "World actor queued for destroy on game server"
+          : "Launcher slot cleared (no bound world actor)",
+      };
     } catch (e: any) {
       return reply.code(e?.statusCode || 500).send({ error: e?.message || String(e) });
     }
@@ -298,6 +744,210 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     }
   });
 
+  // --- Game-server character DB (bind / wipe / full state) ---
+
+  function requireGameSecret(req: FastifyRequest): void {
+    const header = String(req.headers["x-voa-game-secret"] || "").trim();
+    const q = String((req.query as { secret?: string })?.secret || "").trim();
+    const secret = header || q;
+    if (!secret || secret !== config.gameServerSecret) {
+      const err = new Error("Unauthorized game server") as Error & {
+        statusCode: number;
+      };
+      err.statusCode = 401;
+      throw err;
+    }
+  }
+
+  function sessionRow(session: string) {
+    return getDb()
+      .prepare(
+        `SELECT user_id, profile_id FROM game_sessions
+         WHERE session_id = ? AND datetime(expires_at) > datetime('now')`
+      )
+      .get(session) as { user_id: number; profile_id: number } | undefined;
+  }
+
+  /**
+   * Spawn binding for game server: which world actor belongs to this slot,
+   * plus last saved position / gear / inventory / map markers.
+   */
+  app.get("/v1/game/character-binding", async (req, reply) => {
+    try {
+      requireGameSecret(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 401).send({ error: e?.message || "unauthorized" });
+    }
+    const q = req.query as {
+      profileId?: string;
+      slot?: string;
+      session?: string;
+    };
+    let profileId = Number(q.profileId);
+    let slot = Number(q.slot);
+    if (q.session) {
+      const row = sessionRow(String(q.session));
+      if (!row) return reply.code(401).send({ error: "Invalid session" });
+      profileId = row.profile_id;
+      if (!(slot >= 0 && slot <= 1)) {
+        const meta = getDb()
+          .prepare(`SELECT value FROM meta WHERE key = ?`)
+          .get(`session_slot:${q.session}`) as { value: string } | undefined;
+        slot = meta ? Number(meta.value) : 0;
+      }
+    }
+    if (!(profileId > 0) || !(slot >= 0 && slot <= 1)) {
+      return reply.code(400).send({ error: "profileId and slot required" });
+    }
+    const binding = getCharacterBindingByProfileSlot(profileId, slot);
+    if (!binding) {
+      return reply.code(404).send({ error: "No character for profile/slot" });
+    }
+    const allSlots = listBindingsForProfile(profileId);
+    return { ok: true, profileId, binding, allSlots };
+  });
+
+  /** Bind newly created SkyMP actor form id to launcher slot. */
+  app.post("/v1/game/character-bind", async (req, reply) => {
+    try {
+      requireGameSecret(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 401).send({ error: e?.message || "unauthorized" });
+    }
+    const body = (req.body || {}) as {
+      profileId?: number;
+      slot?: number;
+      actorFormId?: number;
+    };
+    try {
+      const character = bindCharacterActor(
+        Number(body.profileId),
+        Number(body.slot),
+        Number(body.actorFormId)
+      );
+      return { ok: true, character };
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 500).send({ error: e?.message || String(e) });
+    }
+  });
+
+  /**
+   * Full character state upsert (name, pos, equipment, inventory, map markers).
+   * Called by gamemode on disconnect / interval, or client with session auth.
+   */
+  app.post("/v1/game/character-state", async (req, reply) => {
+    const body = (req.body || {}) as {
+      secret?: string;
+      session?: string;
+      profileId?: number;
+      slot?: number;
+      name?: string;
+      actorFormId?: number;
+      worldOrCell?: number;
+      pos?: number[];
+      angleZ?: number;
+      equipment?: unknown;
+      inventory?: unknown;
+      appearance?: unknown;
+      mapMarkers?: unknown;
+    };
+
+    let profileId = 0;
+    let slot =
+      typeof body.slot === "number" && body.slot >= 0 && body.slot <= 1
+        ? body.slot
+        : 0;
+
+    const headerSecret = String(req.headers["x-voa-game-secret"] || "").trim();
+    const secret = headerSecret || String(body.secret || "").trim();
+    if (secret && secret === config.gameServerSecret) {
+      profileId = Number(body.profileId) || 0;
+    } else if (body.session) {
+      const row = sessionRow(String(body.session));
+      if (!row) return reply.code(401).send({ error: "Invalid session" });
+      profileId = row.profile_id;
+      if (typeof body.profileId === "number" && body.profileId !== profileId) {
+        return reply.code(403).send({ error: "profile mismatch" });
+      }
+    } else {
+      return reply.code(401).send({ error: "session or game secret required" });
+    }
+    if (!(profileId > 0)) {
+      return reply.code(400).send({ error: "profileId required" });
+    }
+    try {
+      const character = saveCharacterState(profileId, slot, {
+        name: body.name,
+        actorFormId: body.actorFormId,
+        worldOrCell: body.worldOrCell,
+        pos: body.pos,
+        angleZ: body.angleZ,
+        equipment: body.equipment,
+        inventory: body.inventory,
+        appearance: body.appearance,
+        mapMarkers: body.mapMarkers,
+      });
+      return { ok: true, character };
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 500).send({ error: e?.message || String(e) });
+    }
+  });
+
+  /** Pending world-actor destroys for gamemode (delete character in launcher). */
+  app.get("/v1/game/pending-wipes", async (req, reply) => {
+    try {
+      requireGameSecret(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 401).send({ error: e?.message || "unauthorized" });
+    }
+    const wipes = listPendingWipes(100).map((w) => ({
+      id: w.id,
+      profileId: w.profile_id,
+      actorFormId: w.actor_form_id,
+      slot: w.slot,
+    }));
+    return { ok: true, wipes };
+  });
+
+  app.post("/v1/game/pending-wipes/ack", async (req, reply) => {
+    try {
+      requireGameSecret(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 401).send({ error: e?.message || "unauthorized" });
+    }
+    const body = (req.body || {}) as { ids?: number[] };
+    const ids = Array.isArray(body.ids)
+      ? body.ids.map((x) => Number(x)).filter((x) => x > 0)
+      : [];
+    const done = markWipesDone(ids);
+    return { ok: true, done };
+  });
+
+  /**
+   * Game server reports all actors for a profile; API queues destroy for any
+   * not bound to a live launcher slot (fixes "deleted but still Roman").
+   */
+  app.post("/v1/game/orphan-actors", async (req, reply) => {
+    try {
+      requireGameSecret(req);
+    } catch (e: any) {
+      return reply.code(e?.statusCode || 401).send({ error: e?.message || "unauthorized" });
+    }
+    const body = (req.body || {}) as {
+      profileId?: number;
+      actorFormIds?: number[];
+    };
+    const profileId = Number(body.profileId);
+    const ids = Array.isArray(body.actorFormIds)
+      ? body.actorFormIds.map((x) => Number(x)).filter((x) => x > 0)
+      : [];
+    if (!(profileId > 0)) {
+      return reply.code(400).send({ error: "profileId required" });
+    }
+    const queued = queueOrphanWipes(profileId, ids);
+    return { ok: true, queued };
+  });
+
   /** SkyMP master-compatible session lookup */
   app.get("/api/servers/:addr/sessions/:session", async (req, reply) => {
     const { addr, session } = req.params as { addr: string; session: string };
@@ -342,25 +992,70 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     return readLauncherUpdate();
   });
 
-  /** Stream portable launcher binary from data/cdn/launcher/ */
-  app.get("/cdn/launcher/VisionsOfAetherius.exe", async (_req, reply) => {
-    const bin = getLauncherBinaryPath();
-    if (!bin) {
+  /**
+   * Authoritative skymp5-client.js for launchers (must match game-server ClientVerify).
+   * Place file at DATA_DIR/cdn/client/skymp5-client.js (synced from voa-server/dist_front).
+   */
+  app.get("/v1/client/skymp5-client.js", async (_req, reply) => {
+    const filePath = path.join(config.dataDir, "cdn", "client", "skymp5-client.js");
+    if (!fs.existsSync(filePath)) {
       return reply.code(404).send({
-        error: "Launcher binary not published yet",
-        hint: "Place VisionsOfAetherius.exe under DATA_DIR/cdn/launcher/",
+        error: "Multiplayer client not published",
+        hint: "Place skymp5-client.js under DATA_DIR/cdn/client/",
       });
     }
-    const stream = fs.createReadStream(bin);
-    const st = fs.statSync(bin);
+    const st = fs.statSync(filePath);
+    const stream = fs.createReadStream(filePath);
+    return reply
+      .header("Content-Type", "application/javascript; charset=utf-8")
+      .header("Content-Length", String(st.size))
+      .header("Cache-Control", "no-cache")
+      .header("X-VOA-Client-File", "skymp5-client.js")
+      .send(stream);
+  });
+
+  app.get("/v1/client/info", async (_req, reply) => {
+    const filePath = path.join(config.dataDir, "cdn", "client", "skymp5-client.js");
+    if (!fs.existsSync(filePath)) {
+      return reply.code(404).send({ available: false });
+    }
+    const st = fs.statSync(filePath);
+    const buf = fs.readFileSync(filePath);
+    const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
+    return {
+      available: true,
+      size: st.size,
+      sha256,
+      downloadUrl: `${config.publicUrl.replace(/\/$/, "")}/v1/client/skymp5-client.js`,
+    };
+  });
+
+  /** Stream launcher update artifact (portable .exe or full-app .zip) from data/cdn/launcher/ */
+  app.get("/cdn/launcher/:fileName", async (req, reply) => {
+    const { fileName } = req.params as { fileName: string };
+    const allowed = new Set([
+      "VisionsOfAetherius.exe",
+      "VisionsOfAetherius-update.zip",
+      "VOA-Launcher-update.zip",
+      "VisionsOfAetherius-Setup.exe",
+    ]);
+    if (!allowed.has(fileName)) {
+      return reply.code(404).send({ error: "Unknown launcher artifact" });
+    }
+    const exact = getLauncherCdnFile(fileName);
+    if (!exact) {
+      return reply.code(404).send({
+        error: "Launcher artifact not published yet",
+        hint: `Place ${fileName} under DATA_DIR/cdn/launcher/`,
+      });
+    }
+    const stream = fs.createReadStream(exact);
+    const st = fs.statSync(exact);
     return reply
       .header("Content-Type", "application/octet-stream")
-      .header(
-        "Content-Disposition",
-        'attachment; filename="VisionsOfAetherius.exe"'
-      )
+      .header("Content-Disposition", `attachment; filename="${fileName}"`)
       .header("Content-Length", String(st.size))
-      .header("Cache-Control", "public, max-age=300")
+      .header("Cache-Control", "public, max-age=120")
       .send(stream);
   });
 
@@ -377,14 +1072,35 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     return pkg;
   });
 
-  /** Stream a single package archive (zip) for the launcher download manager */
+  /**
+   * Stream a local VOA package archive for the launcher download manager.
+   * Nexus packages are NOT proxied here — the launcher downloads them with the
+   * user's personal Nexus API key so Free/Premium is applied to their account.
+   */
   app.get("/v1/mods/:id/download", async (req, reply) => {
     const { id } = req.params as { id: string };
+    const meta = getCatalogMeta(id);
+    if (!meta) {
+      return reply.code(404).send({ error: "Package not found" });
+    }
+
+    if (meta.source === "nexus") {
+      return reply.code(400).send({
+        error: "Nexus packages must be downloaded with your own Nexus account",
+        hint: "Log in to Nexus Mods in the launcher Account tab (browser OAuth). VOA does not proxy Nexus downloads.",
+        source: "nexus",
+        nexusGame: meta.nexusGame,
+        nexusModId: meta.nexusModId,
+        nexusFileId: meta.nexusFileId,
+        remapSkseToData: Boolean(meta.remapSkseToData),
+      });
+    }
+
     const resolved = resolvePackageArchive(id);
     if (!resolved) {
       return reply.code(404).send({ error: "Package archive not available" });
     }
-    const { meta, archivePath } = resolved;
+    const { meta: localMeta, archivePath } = resolved;
     const st = fs.statSync(archivePath);
     const stream = fs.createReadStream(archivePath);
     return reply
@@ -392,10 +1108,11 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       .header("Content-Length", st.size)
       .header(
         "Content-Disposition",
-        `attachment; filename="${meta.filename.replace(/"/g, "")}"`
+        `attachment; filename="${localMeta.filename.replace(/"/g, "")}"`
       )
-      .header("X-VOA-Package-Id", meta.id)
-      .header("X-VOA-Package-Version", meta.version)
+      .header("X-VOA-Package-Id", localMeta.id)
+      .header("X-VOA-Package-Version", localMeta.version)
+      .header("X-VOA-Package-Source", "local")
       .send(stream);
   });
 
@@ -499,9 +1216,10 @@ Discord rejects the login until the redirect URL is registered on <em>this exact
       )
       .run(state, verifier, redirectUri, new Date().toISOString(), expiresAt);
 
-    // identify = profile; guilds = community membership gate (double security)
+    // identify = profile; guilds = community membership;
+    // guilds.members.read = own roles in guild (staff Admin tab without bot token)
     const scopes = config.requireDiscordGuild
-      ? "identify guilds"
+      ? "identify guilds guilds.members.read"
       : "identify";
     const params = new URLSearchParams({
       client_id: config.discordClientId,
@@ -622,6 +1340,27 @@ Discord rejects the login until the redirect URL is registered on <em>this exact
     });
     if (user.banned) {
       return { ok: false, status: 403, error: "Your account is banned.", title: "Banned" };
+    }
+
+    // Resolve Founder/SGM/GM roles at login (OAuth member roles → DB cache)
+    try {
+      const staff = await refreshStaffRolesAtLogin(
+        me.id,
+        tokenJson.access_token,
+        user.id
+      );
+      app.log.info(
+        {
+          discordId: me.id,
+          profileId: user.profile_id,
+          isStaff: staff.isStaff,
+          roles: staff.roleLabels,
+          method: staff.method,
+        },
+        "staff role check at login"
+      );
+    } catch (eStaff) {
+      app.log.warn({ err: eStaff, discordId: me.id }, "staff role refresh failed");
     }
 
     const accessToken = await signAccessToken(user);

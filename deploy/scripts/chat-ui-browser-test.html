@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>VOA chat test pending</title></head>
+<body>
+<div id="chat"><div class="list"></div></div>
+<pre id="out"></pre>
+<script>
+// Minimal RH store + chatReducer + COMMAND path (mirrors production)
+function chatReduce(state, action) {
+  state = state || { list: [], listLimit: 50, inputShow: false };
+  if (action.type === 'CHAT_SHOW') return Object.assign({}, state, { inputShow: true });
+  if (action.type === 'CHAT_ADD_MESSAGE') {
+    var list = state.list.slice();
+    list.push(action.data.message);
+    while (list.length > state.listLimit) list.shift();
+    return Object.assign({}, state, { list: list });
+  }
+  return state;
+}
+var state = { list: [], listLimit: 50, inputShow: false };
+window.storage = {
+  dispatch: function(action) {
+    if (action.type === 'COMMAND') {
+      var alter0 = action.data.alter[0];
+      var data = alter0 && alter0.length ? JSON.parse(alter0) : null;
+      window.storage.dispatch({ type: action.data.commandType, data: data });
+      return;
+    }
+    state = chatReduce(state, action);
+    render();
+  }
+};
+function getMessageText(string) {
+  var hexCount = 0;
+  for (var i = 0; i < string.length; i++) {
+    if (i + 1 !== string.length && string[i] === '#' && string[i + 1] === '{') {
+      var hex = string.substring(i + 2, i + 8);
+      hexCount++;
+      string = string.substring(0, i) + '<span style="color:#' + hex + ';">' + string.substring(i + 9);
+    }
+  }
+  for (var j = 0; j < hexCount; j++) string += '</span>';
+  return string;
+}
+function render() {
+  var list = document.querySelector('#chat .list');
+  list.innerHTML = state.list.map(function(m) {
+    return '<div class="message">' + getMessageText(m) + '</div>';
+  }).join('');
+}
+// Exact client dispatch builder
+function dispatch(commandType, dataObj) {
+  var payload = '{}';
+  if (dataObj != null) payload = JSON.stringify(dataObj).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  var src = "try{if(window.storage&&window.storage.dispatch){window.storage.dispatch({type:'COMMAND',data:{commandType:'" +
+    commandType + "',alter:['" + payload + "']}});}}catch(e){}";
+  // eslint-disable-next-line no-eval
+  eval(src);
+}
+// Simulate VOA path
+dispatch('CHAT_SHOW', {});
+var msg = '#{efc94a}[L] You: #{f0ebe3}hello-test-from-voa';
+dispatch('CHAT_ADD_MESSAGE', { message: msg });
+dispatch('CHAT_ADD_MESSAGE', { message: '#{efc94a}[L] You: #{f0ebe3}second' });
+
+var text = document.querySelector('#chat .list').innerText;
+var ok = state.list.length === 2 && text.indexOf('hello-test-from-voa') >= 0 && text.indexOf('second') >= 0;
+document.title = ok ? 'VOA_CHAT_PASS' : 'VOA_CHAT_FAIL';
+document.getElementById('out').textContent = JSON.stringify({
+  ok: ok,
+  listLen: state.list.length,
+  list: state.list,
+  innerText: text,
+  inputShow: state.inputShow
+}, null, 2);
+</script>
+</body>
+</html>

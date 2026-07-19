@@ -21,6 +21,14 @@ if (-not $portable) { throw "Portable exe not found in $Release" }
 # Single downloadable binary (stable name). Versioned build stays under apps/launcher/release/.
 Copy-Item $portable.FullName (Join-Path $Out "VisionsOfAetherius.exe")
 
+# NSIS installer (desktop shortcut + Start Menu) when present
+$setup = Get-ChildItem $Release -Filter "VisionsOfAetherius-Setup-*.exe" |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1
+if ($setup) {
+  Copy-Item $setup.FullName (Join-Path $Out "VisionsOfAetherius-Setup.exe")
+}
+
 # Player docs
 Copy-Item (Join-Path $PSScriptRoot "PUBLIC-PLAYER-README.md") (Join-Path $Out "README.txt")
 
@@ -47,6 +55,9 @@ Get-ChildItem $DesktopPublic -Filter "VisionsOfAetherius*.exe" -ErrorAction Sile
   Where-Object { $_.Name -ne "VisionsOfAetherius.exe" } |
   Remove-Item -Force -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $Out "VisionsOfAetherius.exe") (Join-Path $DesktopPublic "VisionsOfAetherius.exe") -Force
+if (Test-Path (Join-Path $Out "VisionsOfAetherius-Setup.exe")) {
+  Copy-Item (Join-Path $Out "VisionsOfAetherius-Setup.exe") (Join-Path $DesktopPublic "VisionsOfAetherius-Setup.exe") -Force
+}
 Copy-Item (Join-Path $Out "README.txt") (Join-Path $DesktopPublic "README.txt") -Force
 
 # Sync Desktop dev package (same binary + bat forcing local API)

@@ -1,0 +1,10 @@
+{
+    "size":  142962668,
+    "channel":  "stable",
+    "sha256":  "85cfe2a888a63a722af5376f3ca22aed85b45b068f19f3e7204f57c971c880f1",
+    "format":  "zip",
+    "downloadUrl":  "http://178.156.158.116:3100/cdn/launcher/VisionsOfAetherius-update.zip",
+    "version":  "0.2.16",
+    "notes":  "0.2.16: Opt-in Support Logs (Settings) with legal disclaimer, private storage, 30-day retention; Wait key unbound for chat; Chromium ON; native in-game chat (T); controlmap install on Play.",
+    "minVersion":  "0.1.0"
+}

@@ -46,83 +46,478 @@ System.register("build/dist/client/Data/Platform/Modules/skyrimPlatform", [], fu
         }
     };
 });
-System.register("skymp5-client/src/front/browser", ["build/dist/client/Data/Platform/Modules/skyrimPlatform"], function (exports_2, context_2) {
+System.register("skymp5-client/src/front/browser", ["build/dist/client/Data/Platform/Modules/skyrimPlatform", "skymp5-client/src/front/networking"], function (exports_2, context_2) {
     "use strict";
-    var skyrimPlatform_1, main;
+    var skyrimPlatform_1, networking_br, main;
     var __moduleName = context_2 && context_2.id;
     return {
         setters: [
             function (skyrimPlatform_1_1) {
                 skyrimPlatform_1 = skyrimPlatform_1_1;
+            },
+            function (networking_br_1) {
+                networking_br = networking_br_1;
             }
         ],
         execute: function () {
+            // Keizaal/Red-House style: CEF always on in world; Enter/T opens chat input
             exports_2("main", main = function () {
+                var sp = skyrimPlatform_1;
                 var badMenus = [
-                    "BarterMenu" /* Barter */,
-                    "Book Menu" /* Book */,
-                    "ContainerMenu" /* Container */,
-                    "Crafting Menu" /* Crafting */,
-                    "GiftMenu" /* Gift */,
-                    "InventoryMenu" /* Inventory */,
-                    "Journal Menu" /* Journal */,
-                    "Lockpicking Menu" /* Lockpicking */,
-                    "Loading Menu" /* Loading */,
-                    "MapMenu" /* Map */,
-                    "RaceSex Menu" /* RaceSex */,
-                    "StatsMenu" /* Stats */,
-                    "TweenMenu" /* Tween */,
-                    "Console" /* Console */,
-                    "Main Menu" /* Main */
+                    "BarterMenu", "Book Menu", "ContainerMenu", "Crafting Menu", "GiftMenu",
+                    "InventoryMenu", "Journal Menu", "Lockpicking Menu", "Loading Menu", "MapMenu",
+                    "RaceSex Menu", "StatsMenu", "TweenMenu", "Console", "Main Menu"
                 ];
                 var browserVisibleState = false;
-                skyrimPlatform_1.browser.setVisible(false);
-                var setBrowserVisible = function (state) {
-                    browserVisibleState = state;
-                    skyrimPlatform_1.browser.setVisible(state);
-                };
-                skyrimPlatform_1.once('update', function () {
-                    browserVisibleState = true;
-                    skyrimPlatform_1.browser.setVisible(true);
-                });
                 var browserFocusedState = false;
-                var setBrowserFocused = function (state) {
-                    browserFocusedState = state;
-                    skyrimPlatform_1.browser.setFocused(state);
-                };
                 var badMenuOpen = true;
+                var isInputFocused = false;
                 var lastBadMenuCheck = 0;
-                skyrimPlatform_1.on('update', function () {
-                    if (Date.now() - lastBadMenuCheck > 200) {
-                        lastBadMenuCheck = Date.now();
-                        badMenuOpen = badMenus.findIndex(function (menu) { return skyrimPlatform_1.Ui.isMenuOpen(menu); }) !== -1;
-                        skyrimPlatform_1.browser.setVisible(browserVisibleState && !badMenuOpen);
+                var bridgeInstalled = false;
+                var keyWasDown = {};
+                var lastOpenAt = 0;
+                var lastCloseAt = 0;
+
+                sp.browser.setVisible(false);
+
+                var setBrowserVisible = function (state) {
+                    browserVisibleState = !!state;
+                    try { sp.browser.setVisible(browserVisibleState); } catch (e) {}
+                };
+                var setBrowserFocused = function (state) {
+                    browserFocusedState = !!state;
+                    try { sp.browser.setFocused(browserFocusedState); } catch (e) {}
+                    try { sp.storage["voaChatFocused"] = browserFocusedState; } catch (e2) {}
+                    if (browserFocusedState) {
+                        try { sp.storage["voaForceBrowser"] = true; } catch (e3) {}
+                    }
+                };
+                // Rising-edge key detect (avoids spam while held / CEF key echo)
+                var keyEdge = function (code) {
+                    var now = false;
+                    try { now = !!sp.Input.isKeyPressed(code); } catch (e) { now = false; }
+                    var was = !!keyWasDown[code];
+                    keyWasDown[code] = now;
+                    return now && !was;
+                };
+
+                // Dispatch Redux actions into the Red House / stock front (window.storage)
+                var dispatch = function (commandType, dataObj) {
+                    var payload = "{}";
+                    try {
+                        if (dataObj != null) payload = JSON.stringify(dataObj).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+                    } catch (eJ) { payload = "{}"; }
+                    var src =
+                        "try{if(window.storage&&window.storage.dispatch){window.storage.dispatch({type:'COMMAND',data:{commandType:'" +
+                        commandType + "',alter:['" + payload + "']}});}}catch(e){}";
+                    try { sp.browser.executeJavaScript(src); } catch (e) {}
+                };
+                try { sp.storage._voaFrontDispatch = dispatch; } catch (eD) {}
+
+                // Bridge cef::chat:send -> native once (never re-wrap / nest)
+                var installChatBridge = function () {
+                    // Single install script: wrap mp.send exactly once; re-apply only if front replaced mp.send
+                    var js =
+                        "(function(){try{" +
+                        "if(!window.mp)window.mp={};" +
+                        "if(window.mp.__voaHooked===1&&typeof window.mp.send==='function')return 'already';" +
+                        "var prev=window.mp.send;" +
+                        "var lastMeta='';" +
+                        "var lastMetaAt=0;" +
+                        "window.mp.send=function(type,data){" +
+                        "try{" +
+                        "if(type==='cef::chat:send'){" +
+                        "var d=(typeof data==='string')?data:(data&&data.text!=null?String(data.text):String(data));" +
+                        // Meta: only notify native when value CHANGES (front may spam every frame)
+                        "if(d.indexOf('/focusInputField')===0||d.indexOf('/browserFocused')===0){" +
+                        "if(d===lastMeta)return;" +
+                        "lastMeta=d;lastMetaAt=Date.now();" +
+                        "try{window.skyrimPlatform.sendMessage('voaRhChat',d);}catch(em){}" +
+                        "return;" +
+                        "}" +
+                        // Real chat text
+                        "try{window.skyrimPlatform.sendMessage('voaRhChat',d);}catch(e1){}" +
+                        "return;" +
+                        "}" +
+                        "}catch(e){}" +
+                        "try{if(typeof prev==='function'&&!prev.__voaHooked)return prev(type,data);}catch(e2){}" +
+                        "try{if(window.skymp&&window.skymp.send)window.skymp.send({type:type,data:data});}catch(e3){}" +
+                        "};" +
+                        "window.mp.send.__voaHooked=1;" +
+                        "window.mp.__voaHooked=1;" +
+                        "window.__voaChatBridge=1;" +
+                        "return 'ok';" +
+                        "}catch(e0){return 'err:'+e0;}})();";
+                    try {
+                        sp.browser.executeJavaScript(js);
+                        if (!bridgeInstalled) {
+                            bridgeInstalled = true;
+                            sp.printConsole("VOA: CEF chat bridge installed (single-wrap)");
+                        }
+                    } catch (e) {
+                        try { sp.printConsole("VOA: chat bridge fail " + e); } catch (e2) {}
+                    }
+                };
+                try { sp.storage._voaInstallChatBridge = installChatBridge; } catch (eB) {}
+
+                var openChat = function (why) {
+                    if (badMenuOpen) return;
+                    if (browserFocusedState) return; // already open
+                    if (Date.now() - lastCloseAt < 200) return; // ignore bounce after close
+                    // Block only hard menus (no spawn-grace delay — chat is server-ready)
+                    try {
+                        if (sp.Ui.isMenuOpen("Loading Menu") || sp.Ui.isMenuOpen("Main Menu") ||
+                            sp.Ui.isMenuOpen("RaceSex Menu"))
+                            return;
+                    } catch (eLoad) {}
+                    lastOpenAt = Date.now();
+                    setBrowserVisible(true);
+                    setBrowserFocused(true);
+                    dispatch("CHAT_SHOW");
+                    installChatBridge();
+                    try { sp.printConsole("VOA chat open (" + why + ") CHAT_SHOW+focus"); } catch (e) {}
+                    try { sp.Debug.notification("Chat open - type then Enter"); } catch (eN) {}
+                };
+                var closeChat = function (why) {
+                    if (!browserFocusedState && !isInputFocused) return; // already closed
+                    if (Date.now() - lastOpenAt < 250) return; // ignore meta spam right after open
+                    if (Date.now() - lastCloseAt < 200) return; // debounce
+                    lastCloseAt = Date.now();
+                    isInputFocused = false;
+                    dispatch("CHAT_HIDE");
+                    setBrowserFocused(false);
+                    try { sp.printConsole("VOA chat close (" + (why || "?") + ")"); } catch (e) {}
+                };
+                try { sp.storage._voaOpenChat = openChat; sp.storage._voaCloseChat = closeChat; } catch (eS) {}
+
+                // Delay CEF show until after main menu / first world frame - less loadGame race
+                sp.once("update", function () {
+                    try {
+                        sp.Utility.wait(2.0).then(function () {
+                            browserVisibleState = true;
+                            try { sp.browser.setFocused(false); } catch (eF) {}
+                            try { sp.browser.setVisible(true); } catch (eV) {}
+                            installChatBridge();
+                            try { sp.printConsole("VOA browser: visible + chat bridge (Enter/T open chat)"); } catch (eL) {}
+                        });
+                    } catch (eW) {
+                        browserVisibleState = true;
+                        try { sp.browser.setVisible(true); } catch (eV2) {}
+                        installChatBridge();
                     }
                 });
-                var binding = new Map();
-                binding.set([60 /* F2 */], function () { return setBrowserVisible(!browserVisibleState); });
-                binding.set([64 /* F6 */], function () { return setBrowserFocused(!browserFocusedState); });
-                binding.set([1 /* Escape */], function () { return (browserFocusedState ? setBrowserFocused(false) : undefined); });
-                var lastNumKeys = 0;
-                skyrimPlatform_1.on('update', function () {
-                    var numKeys = skyrimPlatform_1.Input.getNumKeysPressed();
-                    if (lastNumKeys === numKeys)
-                        return;
-                    lastNumKeys = numKeys;
-                    binding.forEach(function (fn, keyCodes) {
-                        if (keyCodes.every(function (key) { return skyrimPlatform_1.Input.isKeyPressed(key); }))
-                            fn();
-                    });
-                });
-                var cfg = {
-                    ip: skyrimPlatform_1.settings["skymp5-client"]["server-ip"],
-                    port: skyrimPlatform_1.settings["skymp5-client"]["server-port"],
+
+                // Chat fully handled here (browser always loads). Do not depend on voaChat setup
+                // flags that can stick in co-save and skip drain handlers.
+
+                var queueUiLine = function (msg) {
+                    try {
+                        var arr = [];
+                        var raw = sp.storage["voaChatUiPendingJson"];
+                        if (typeof raw === "string" && raw.length) {
+                            try { arr = JSON.parse(raw); } catch (eP) { arr = []; }
+                        }
+                        if (!arr || !arr.length) arr = [];
+                        arr.push(String(msg || ""));
+                        if (arr.length > 40) arr = arr.slice(-40);
+                        sp.storage["voaChatUiPendingJson"] = JSON.stringify(arr);
+                    } catch (eQ) {}
                 };
-                skyrimPlatform_1.printConsole({ cfg: cfg });
+                var sendChatNet = function (text) {
+                    var packet = { t: 15 /* CustomEvent */, eventName: "_voaChat", args: ["say", String(text || "")] };
+                    // 1) Preferred: RemoteServer.send via host hook (sets msg.idx)
+                    try {
+                        if (typeof sp._voaEmit === "function") {
+                            var okEmit = sp._voaEmit(packet, true);
+                            if (okEmit !== false) {
+                                try { sp.printConsole("VOA chat net: emit"); } catch (e0) {}
+                                return true;
+                            }
+                        }
+                    } catch (eEm) {
+                        try { sp.printConsole("VOA chat emit err " + eEm); } catch (e1) {}
+                    }
+                    // 2) networking module
+                    try {
+                        if (networking_br && typeof networking_br.send === "function") {
+                            networking_br.send(packet, true);
+                            try { sp.printConsole("VOA chat net: networking"); } catch (e2) {}
+                            return true;
+                        }
+                    } catch (eN) {
+                        try { sp.printConsole("VOA chat net err " + eN); } catch (e3) {}
+                    }
+                    // 3) raw plugin
+                    try {
+                        if (sp.mpClientPlugin && typeof sp.mpClientPlugin.send === "function") {
+                            sp.mpClientPlugin.send(JSON.stringify(packet), true);
+                            try { sp.printConsole("VOA chat net: plugin"); } catch (e4) {}
+                            return true;
+                        }
+                    } catch (eP) {
+                        try { sp.printConsole("VOA chat plugin err " + eP); } catch (e5) {}
+                    }
+                    try {
+                        sp.printConsole("VOA chat net: FAIL emit=" + (typeof sp._voaEmit) +
+                            " net=" + (networking_br ? typeof networking_br.send : "null"));
+                    } catch (e6) {}
+                    return false;
+                };
+                var processChatText = function (text) {
+                    text = String(text != null ? text : "").trim();
+                    if (!text) return;
+                    try { sp.printConsole("VOA chat >> " + text); } catch (eL) {}
+                    var msg = "#{efc94a}[L] You: #{f0ebe3}" + text;
+                    queueUiLine(msg);
+                    var ok = sendChatNet(text);
+                    if (!ok) {
+                        queueUiLine("#{8ec8ff}[!] System: #{f0ebe3}Message not sent (not connected yet).");
+                    }
+                    try {
+                        sp.storage["voaForceBrowser"] = true;
+                        sp.storage["voaChatLogUntil"] = Date.now() + 180000;
+                        sp.storage["voaChatCloseReq"] = "sent";
+                        sp.storage["voaChatCloseAt"] = Date.now() + 700;
+                    } catch (eC) {}
+                };
+
+                // Keep browser visible when not in blocking menus; force while chat focused / recent log
+                sp.on("update", function () {
+                    // 1) Drain CEF-typed text (queued from browserMessage) — primary path
+                    try {
+                        var rxRaw = sp.storage["voaRhChatPendingJson"];
+                        if (rxRaw && typeof rxRaw === "string" && rxRaw !== "[]" && rxRaw.length > 2) {
+                            sp.storage["voaRhChatPendingJson"] = "[]";
+                            var rxItems = [];
+                            try { rxItems = JSON.parse(rxRaw); } catch (eR) { rxItems = []; }
+                            for (var ri = 0; ri < rxItems.length; ri++) {
+                                try { processChatText(rxItems[ri]); } catch (ePt) {
+                                    try { sp.printConsole("VOA chat process err " + ePt); } catch (e3) {}
+                                }
+                            }
+                        }
+                    } catch (eRx) {}
+                    // 2) Drain server push queue (JSON)
+                    try {
+                        var srvRaw = sp.storage["voaChatQueueJson"];
+                        if (srvRaw && typeof srvRaw === "string" && srvRaw !== "[]" && srvRaw.length > 2) {
+                            sp.storage["voaChatQueueJson"] = "[]";
+                            var srvLines = [];
+                            try { srvLines = JSON.parse(srvRaw); } catch (eS) { srvLines = []; }
+                            for (var sj = 0; sj < srvLines.length; sj++) {
+                                var line = srvLines[sj] || {};
+                                var ch = line.channel || "l";
+                                var nm = String(line.name || "");
+                                var tx = String(line.text || "");
+                                var color = ch === "g" ? "efc94a" : (ch === "sys" ? "8ec8ff" : "f0ebe3");
+                                var prefix = ch === "g" ? "[G] " : (ch === "sys" ? "[!] " : "[L] ");
+                                var built = "#{efc94a}" + prefix + (nm ? nm + (ch === "sys" ? " " : ": ") : "") + "#{" + color + "}" + tx;
+                                queueUiLine(built);
+                                try { sp.printConsole("[" + ch + "] " + nm + ": " + tx); } catch (ePr) {}
+                            }
+                        }
+                    } catch (eSrv) {}
+                    // 3) Drain CEF chat UI lines using the SAME dispatch() as CHAT_SHOW
+                    try {
+                        var uiRaw = sp.storage["voaChatUiPendingJson"];
+                        if (uiRaw && typeof uiRaw === "string" && uiRaw !== "[]" && uiRaw.length > 2) {
+                            sp.storage["voaChatUiPendingJson"] = "[]";
+                            var uiLines = [];
+                            try { uiLines = JSON.parse(uiRaw); } catch (eU) { uiLines = []; }
+                            if (uiLines && uiLines.length) {
+                                try { sp.browser.setVisible(true); } catch (eV0) {}
+                                for (var ui = 0; ui < uiLines.length; ui++) {
+                                    var m = String(uiLines[ui] != null ? uiLines[ui] : "");
+                                    if (!m) continue;
+                                    dispatch("CHAT_ADD_MESSAGE", { message: m });
+                                    try {
+                                        sp.browser.executeJavaScript(
+                                            "(function(){try{" +
+                                            "var ok=!!(window.storage&&window.storage.dispatch);" +
+                                            "var list=!!document.querySelector('#chat .list');" +
+                                            "if(window.skyrimPlatform)window.skyrimPlatform.sendMessage('voaChatUi',(ok?'store':'nostore')+':'+(list?'list':'nolist'));" +
+                                            "}catch(e){}})();"
+                                        );
+                                    } catch (eAck) {}
+                                    try { sp.printConsole("VOA chat UI dispatch: " + m.slice(0, 60)); } catch (eL) {}
+                                }
+                            }
+                        }
+                    } catch (eUi) {
+                        try { sp.printConsole("VOA chat UI drain err " + eUi); } catch (e2) {}
+                    }
+                    // Deferred close from chat send (safe on update)
+                    try {
+                        var closeWhy = sp.storage["voaChatCloseReq"];
+                        if (closeWhy) {
+                            var closeAt = Number(sp.storage["voaChatCloseAt"]) || 0;
+                            if (!closeAt) {
+                                sp.storage["voaChatCloseAt"] = Date.now() + 400;
+                            } else if (Date.now() >= closeAt) {
+                                sp.storage["voaChatCloseReq"] = null;
+                                sp.storage["voaChatCloseAt"] = 0;
+                                closeChat(String(closeWhy));
+                            }
+                        }
+                    } catch (eCr) {}
+                    if (Date.now() - lastBadMenuCheck > 150) {
+                        lastBadMenuCheck = Date.now();
+                        badMenuOpen = false;
+                        try {
+                            for (var i = 0; i < badMenus.length; i++) {
+                                if (sp.Ui.isMenuOpen(badMenus[i])) { badMenuOpen = true; break; }
+                            }
+                        } catch (eM) { badMenuOpen = false; }
+                        var force = false;
+                        var logUntil = 0;
+                        try {
+                            force = sp.storage["voaForceBrowser"] === true || sp.storage["voaChatFocused"] === true;
+                            logUntil = Number(sp.storage["voaChatLogUntil"]) || 0;
+                        } catch (eF) {}
+                        // Always show CEF when chat log recently updated (messages must stay visible)
+                        if (force || browserFocusedState || (logUntil && Date.now() < logUntil)) {
+                            try { sp.browser.setVisible(true); } catch (eV) {}
+                        } else {
+                            try { sp.browser.setVisible(browserVisibleState && !badMenuOpen); } catch (eV2) {}
+                        }
+                    }
+                });
+
+                // browserMessage from CEF - handle several sendMessage shapes
+                var lastFocusMeta = "";
+                var lastFocusMetaAt = 0;
+                var handleRhPayload = function (text, why) {
+                    text = String(text != null ? text : "").trim();
+                    if (!text) return;
+                    // Meta: silent, de-duped, no chat path
+                    if (text.indexOf("/focusInputField") === 0) {
+                        var want = text.indexOf("true") >= 0;
+                        if (isInputFocused === want) return;
+                        isInputFocused = want;
+                        return;
+                    }
+                    if (text.indexOf("/browserFocused") === 0) {
+                        if (text.indexOf("false") >= 0) {
+                            // Ignore spam / bounce right after open
+                            if (Date.now() - lastOpenAt < 500) return;
+                            closeChat("front-unfocus");
+                        }
+                        return;
+                    }
+                    if (/^\/(anim|Craft|Trade|Interaction|SelectBox)\b/i.test(text)) return;
+                    // Real chat only. SP forbids calling storage *functions* from browserMessage.
+                    // Also: SP storage does NOT persist in-place array mutations — must reassign.
+                    // Use a JSON string queue so the next update tick can drain reliably.
+                    try { sp.printConsole("VOA chat rx (" + why + "): " + text.slice(0, 80)); } catch (eL) {}
+                    try {
+                        var arr = [];
+                        try {
+                            var rawQ = sp.storage["voaRhChatPendingJson"];
+                            if (typeof rawQ === "string" && rawQ.length)
+                                arr = JSON.parse(rawQ);
+                        } catch (eParse) { arr = []; }
+                        if (!arr || !arr.length) arr = [];
+                        arr.push(text);
+                        if (arr.length > 40) arr = arr.slice(-40);
+                        sp.storage["voaRhChatPendingJson"] = JSON.stringify(arr);
+                    } catch (eSend) {
+                        try { sp.printConsole("VOA chat queue err " + eSend); } catch (e2) {}
+                    }
+                };
+
+                sp.on("browserMessage", function (event) {
+                    try {
+                        if (!event || !event.arguments || !event.arguments.length) return;
+                        var args = event.arguments;
+                        var a0 = args[0];
+                        var a1 = args.length > 1 ? args[1] : undefined;
+
+                        // sendMessage('voaRhChat', text)
+                        if (a0 === "voaRhChat") {
+                            handleRhPayload(a1, "str");
+                            return;
+                        }
+                        // sendMessage(['voaRhChat', text]) as single arg
+                        if (a0 && (Object.prototype.toString.call(a0) === "[object Array]" || (typeof a0 === "object" && a0.length != null && typeof a0 !== "string"))) {
+                            if (a0[0] === "voaRhChat") {
+                                handleRhPayload(a0[1], "arr");
+                                return;
+                            }
+                            if (a0[0] === "voaChat") {
+                                if (a0[1] === "send") handleRhPayload(a0[2], "legacy");
+                                if (a0[1] === "close") closeChat("legacy");
+                                return;
+                            }
+                            // some CEF builds flatten: arguments = ['voaRhChat', text] already as multi - handled above
+                        }
+                        // sendMessage({type:'voaRhChat', data:text})
+                        if (a0 && typeof a0 === "object" && a0.type) {
+                            if (a0.type === "voaRhChat") {
+                                handleRhPayload(a0.data != null ? a0.data : a0.text, "obj");
+                                return;
+                            }
+                            if (a0.type === "focusInputField") isInputFocused = !!a0.data;
+                            else if (a0.type === "browserFocused") {
+                                if (a0.data === false || a0.data === 0 || a0.data === "false")
+                                    closeChat("obj-unfocus");
+                            }
+                            else if (a0.type === "browserVisible") setBrowserVisible(!!a0.data);
+                            else if (a0.type === "front-loaded") installChatBridge();
+                            return;
+                        }
+                        if (a0 === "front-loaded") installChatBridge();
+                        // CEF UI push ack
+                        if (a0 === "voaChatUi") {
+                            try { sp.printConsole("VOA chat UI cef: " + String(a1)); } catch (eAck) {}
+                            return;
+                        }
+                    } catch (eBm) {
+                        try { sp.printConsole("VOA browserMessage err " + eBm); } catch (e3) {}
+                    }
+                });
+
+                // Edge-triggered keys (no hold / CEF echo spam)
+                sp.on("update", function () {
+                    var esc = keyEdge(1);
+                    var f2 = keyEdge(60);
+                    var f6 = keyEdge(64);
+                    var enter = keyEdge(28);
+                    var tKey = keyEdge(20);
+                    var yKey = keyEdge(21);
+
+                    // While focused: only Esc from game; CEF owns typing
+                    if (browserFocusedState) {
+                        if (esc) closeChat("esc");
+                        return;
+                    }
+                    if (f2) {
+                        setBrowserVisible(!browserVisibleState);
+                        return;
+                    }
+                    if (f6 && !badMenuOpen) {
+                        openChat("F6");
+                        return;
+                    }
+                    if (!badMenuOpen && !isInputFocused) {
+                        if (enter) openChat("Enter");
+                        else if (tKey || yKey) openChat("T");
+                    }
+                });
+
+                var cfg = {
+                    ip: sp.settings["skymp5-client"]["server-ip"],
+                    port: sp.settings["skymp5-client"]["server-port"],
+                };
+                sp.printConsole({ cfg: cfg });
                 var uiPort = cfg.port === 7777 ? 3000 : cfg.port + 1;
                 var url = "http://" + cfg.ip + ":" + uiPort + "/ui/index.html";
-                skyrimPlatform_1.printConsole("loading url " + url);
-                skyrimPlatform_1.browser.loadUrl(url);
+                sp.printConsole("loading url " + url);
+                sp.browser.loadUrl(url);
+                // Install bridge after page load (idempotent single-wrap)
+                try {
+                    sp.Utility.wait(2.0).then(function () { installChatBridge(); });
+                    sp.Utility.wait(6.0).then(function () { installChatBridge(); });
+                } catch (eW) {}
             });
         }
     };
@@ -310,9 +705,109 @@ System.register("skymp5-client/src/front/console", ["build/dist/client/Data/Plat
                 placeatme: [CmdArgument.ObjectReference, CmdArgument.BaseForm],
                 disable: [CmdArgument.ObjectReference],
                 mp: [CmdArgument.ObjectReference, CmdArgument.String],
+                announce: [CmdArgument.String],
+                tp: [CmdArgument.String],
+                summon: [CmdArgument.String],
+                giveplayerspell: [CmdArgument.String, CmdArgument.Int],
+                listplayers: [],
             };
-            immuneSchema = ["mp"];
-            nonVanilaCommands = ["mp"];
+            immuneSchema = ["mp", "announce", "tp", "summon", "giveplayerspell", "listplayers"];
+            nonVanilaCommands = ["mp", "announce", "tp", "summon", "giveplayerspell", "listplayers"];
+            var STEAL_POOL = ["ToggleAI", "ToggleCollision", "ShowVars", "ShowAnim", "DumpTextureList", "TestFade", "DumpNiUpdates", "ToggleGodMode", "StartMasterFileSeekData", "PreloadExterior"];
+            // VOA: console locked to Discord staff (Founder / SGM / GM) ??? refreshed from API
+            var refreshStaffFlag = function () {
+                try {
+                    var gd = skyrimPlatform_3.settings["skymp5-client"]["gameData"] || {};
+                    var session = typeof gd.session === "string" ? gd.session : "";
+                    var profileId = typeof gd.profileId === "number" ? gd.profileId : 0;
+                    var master = skyrimPlatform_3.settings["skymp5-client"]["master"] || "http://127.0.0.1:3100";
+                    if (typeof master !== "string" || !master)
+                        master = "http://127.0.0.1:3100";
+                    master = master.replace(/\/$/, "");
+                    if (!session && !profileId)
+                        return;
+                    var path = "/v1/game/is-staff?";
+                    if (session)
+                        path += "session=" + encodeURIComponent(session);
+                    else
+                        path += "profileId=" + encodeURIComponent(String(profileId));
+                    var client = new skyrimPlatform_3.HttpClient(master);
+                    client.get(path).then(function (res) {
+                        try {
+                            if (!res || res.status !== 200 || !res.body)
+                                return;
+                            var data = JSON.parse(res.body);
+                            skyrimPlatform_3.storage["voaIsStaff"] = data && data.isStaff === true;
+                            skyrimPlatform_3.storage["voaStaffRoles"] = (data && data.roles) || [];
+                            skyrimPlatform_3.printConsole("VOA console staff=" + !!skyrimPlatform_3.storage["voaIsStaff"] +
+                                (data && data.roles && data.roles.length ? (" roles=" + data.roles.join(",")) : ""));
+                        }
+                        catch (e0) { /* ignore */ }
+                    }).catch(function () { /* ignore */ });
+                }
+                catch (e1) { /* ignore */ }
+            };
+            var staffGate = function () {
+                if (skyrimPlatform_3.storage["voaIsStaff"] === true)
+                    return true;
+                skyrimPlatform_3.printConsole("VOA: console command blocked ??? Admin only (Founder / Senior Gamemaster / Gamemaster)");
+                try {
+                    skyrimPlatform_3.Debug.notification("Console: Admin only");
+                }
+                catch (eN) { /* ignore */ }
+                try {
+                    var now = Date.now();
+                    if (!skyrimPlatform_3.storage["voaStaffCheckAt"] || now - skyrimPlatform_3.storage["voaStaffCheckAt"] > 30000) {
+                        skyrimPlatform_3.storage["voaStaffCheckAt"] = now;
+                        refreshStaffFlag();
+                    }
+                }
+                catch (eR) { /* ignore */ }
+                return false;
+            };
+            var sendVoaConsole = function (commandName, args, send) {
+                skyrimPlatform_3.printConsole("VOA admin console: " + commandName + " " + JSON.stringify(args));
+                try {
+                    var gd2 = skyrimPlatform_3.settings["skymp5-client"]["gameData"] || {};
+                    var profileId2 = typeof gd2.profileId === "number" ? gd2.profileId : 0;
+                    send({
+                        t: messages_1.MsgType.CustomEvent,
+                        eventName: "_voaConsole",
+                        args: [profileId2, commandName, JSON.stringify(args)],
+                    });
+                }
+                catch (eC) {
+                    send({ t: messages_1.MsgType.ConsoleCommand, data: { commandName: commandName, args: args } });
+                }
+            };
+            var tryParseMpVoa = function (args) {
+                if (!args || args.length < 2)
+                    return null;
+                var raw = String(args[1] != null ? args[1] : "").trim();
+                if (!raw)
+                    return null;
+                var s = raw;
+                if ((s.charAt(0) === '"' && s.charAt(s.length - 1) === '"') ||
+                    (s.charAt(0) === "'" && s.charAt(s.length - 1) === "'"))
+                    s = s.slice(1, -1);
+                var parts = s.split(/\s+/).filter(Boolean);
+                if (!parts.length)
+                    return null;
+                var head = parts[0].toLowerCase();
+                var voa = ["announce", "tp", "tpto", "goto", "summon", "bring", "giveplayerspell", "givespell", "addspell", "listplayers", "players"];
+                if (voa.indexOf(head) < 0)
+                    return null;
+                var cmd = head;
+                if (cmd === "tpto" || cmd === "goto")
+                    cmd = "tp";
+                if (cmd === "bring")
+                    cmd = "summon";
+                if (cmd === "givespell" || cmd === "addspell")
+                    cmd = "giveplayerspell";
+                if (cmd === "players")
+                    cmd = "listplayers";
+                return { cmd: cmd, rest: parts.slice(1) };
+            };
             getCommandExecutor = function (commandName, send, localIdToRemoteId) {
                 return function () {
                     var _a;
@@ -320,20 +815,35 @@ System.register("skymp5-client/src/front/console", ["build/dist/client/Data/Plat
                     for (var _i = 0; _i < arguments.length; _i++) {
                         args[_i] = arguments[_i];
                     }
-                    var schema = schemas[commandName];
-                    if (args.length !== schema.length && !immuneSchema.includes(commandName)) {
+                    if (!staffGate())
+                        return false;
+                    if (commandName === "mp") {
+                        var parsed = tryParseMpVoa(args);
+                        if (parsed) {
+                            sendVoaConsole(parsed.cmd, parsed.rest, send);
+                            return false;
+                        }
+                    }
+                    var schema = schemas[commandName] || [];
+                    if (args.length !== schema.length && immuneSchema.indexOf(commandName) < 0) {
                         skyrimPlatform_3.printConsole("Mismatch found in the schema of '" + commandName + "' command");
                         return false;
                     }
                     for (var i = 0; i < args.length; ++i) {
-                        switch (schema[i]) {
-                            case CmdArgument.ObjectReference:
-                                args[i] = localIdToRemoteId(parseInt("" + args[i]));
-                                break;
-                        }
+                        if (schema[i] === CmdArgument.ObjectReference)
+                            args[i] = localIdToRemoteId(parseInt("" + args[i]));
                     }
-                    skyrimPlatform_3.printConsole("sent");
-                    send({ t: messages_1.MsgType.ConsoleCommand, data: { commandName: commandName, args: args } });
+                    var outArgs = args;
+                    if (commandName === "announce" || commandName === "tp" || commandName === "summon") {
+                        outArgs = [args.map(function (a) { return String(a); }).join(" ").trim()];
+                    }
+                    else if (commandName === "giveplayerspell") {
+                        outArgs = args.length === 1 ? ["self", args[0]] : args;
+                    }
+                    else if (commandName === "listplayers") {
+                        outArgs = [];
+                    }
+                    sendVoaConsole(commandName, outArgs, send);
                     if (skyrimPlatform_3.storage["_api_onConsoleCommand"] &&
                         skyrimPlatform_3.storage["_api_onConsoleCommand"]["callback"]) {
                         if (commandName === "mp") {
@@ -348,18 +858,66 @@ System.register("skymp5-client/src/front/console", ["build/dist/client/Data/Plat
                     return false;
                 };
             };
+            var bindNamedCommand = function (name, send, localIdToRemoteId, usedSources) {
+                var command = skyrimPlatform_3.findConsoleCommand(name);
+                if (!command) {
+                    for (var si = 0; si < STEAL_POOL.length; si++) {
+                        var src = STEAL_POOL[si];
+                        if (usedSources[src])
+                            continue;
+                        var c = skyrimPlatform_3.findConsoleCommand(src);
+                        if (c) {
+                            command = c;
+                            usedSources[src] = true;
+                            try {
+                                command.shortName = name;
+                                command.longName = name;
+                            }
+                            catch (eB) { /* ignore */ }
+                            break;
+                        }
+                    }
+                }
+                if (!command) {
+                    skyrimPlatform_3.printConsole("VOA: could not bind console command " + name);
+                    return false;
+                }
+                command.execute = getCommandExecutor(name, send, localIdToRemoteId);
+                skyrimPlatform_3.printConsole("VOA: bound console command " + name);
+                return true;
+            };
             exports_11("setUpConsoleCommands", setUpConsoleCommands = function (send, localIdToRemoteId) {
+                // Default locked until API confirms staff
+                try {
+                    if (skyrimPlatform_3.storage["voaIsStaff"] == null)
+                        skyrimPlatform_3.storage["voaIsStaff"] = false;
+                }
+                catch (e0) { /* ignore */ }
+                refreshStaffFlag();
+                // Re-check shortly after spawn (session ready)
+                try {
+                    skyrimPlatform_3.once("update", function () {
+                        skyrimPlatform_3.Utility.wait(2.0).then(function () { refreshStaffFlag(); });
+                        skyrimPlatform_3.Utility.wait(8.0).then(function () { refreshStaffFlag(); });
+                    });
+                }
+                catch (e1) { /* ignore */ }
                 var command = skyrimPlatform_3.findConsoleCommand(" ConfigureUM") || skyrimPlatform_3.findConsoleCommand("test");
                 if (command) {
                     command.shortName = "mp";
                     command.execute = getCommandExecutor("mp", send, localIdToRemoteId);
                 }
-                Object.keys(schemas).forEach(function (commandName) {
-                    var command = skyrimPlatform_3.findConsoleCommand(commandName);
-                    if (!command || nonVanilaCommands.includes(commandName))
+                ["additem", "placeatme", "disable"].forEach(function (commandName) {
+                    var c = skyrimPlatform_3.findConsoleCommand(commandName);
+                    if (!c)
                         return;
-                    command.execute = getCommandExecutor(commandName, send, localIdToRemoteId);
+                    c.execute = getCommandExecutor(commandName, send, localIdToRemoteId);
                 });
+                var used = {};
+                ["announce", "tp", "summon", "giveplayerspell", "listplayers"].forEach(function (n) {
+                    bindNamedCommand(n, send, localIdToRemoteId, used);
+                });
+                skyrimPlatform_3.printConsole("VOA admin cmds: announce, tp, summon, giveplayerspell, listplayers (or mp . \"announce ...\")");
             });
         }
     };
@@ -388,7 +946,8 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
             exports_12("isPlayerDowned", isPlayerDowned = function () { return isDowned; });
             exports_12("isSpawnProtected", isSpawnProtected = function () { return Date.now() < spawnProtectUntil; });
             exports_12("grantSpawnProtection", grantSpawnProtection = function (ms) {
-                var dur = typeof ms === "number" && ms > 0 ? ms : 45000;
+                // Short protect: long protect was healing away all PvP damage for 45s
+                var dur = typeof ms === "number" && ms > 0 ? ms : 12000;
                 spawnProtectUntil = Date.now() + dur;
                 try {
                     var p = skyrimPlatform_4.Game.getPlayer();
@@ -429,7 +988,7 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
                 if (sec === lastHudSec)
                     return;
                 lastHudSec = sec;
-                // Force CEF visible — default browser UI may be hidden / failed to load server UI
+                // Force CEF visible ??? default browser UI may be hidden / failed to load server UI
                 try {
                     skyrimPlatform_4.browser.setVisible(true);
                 }
@@ -464,7 +1023,7 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
                 // Always also surface countdown via native notification (works without CEF UI)
                 if (sec % 5 === 0 || sec <= 10) {
                     try {
-                        skyrimPlatform_4.Debug.notification("DOWNED — " + sec + "s  |  Press R to respawn at temple");
+                        skyrimPlatform_4.Debug.notification("DOWNED ??? " + sec + "s  |  Press R to respawn at temple");
                     }
                     catch (eN) { /* ignore */ }
                 }
@@ -474,7 +1033,7 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
                 var player = skyrimPlatform_4.Game.getPlayer();
                 if (!player || isDowned)
                     return;
-                // Don't down during spawn protection — heal instead
+                // Don't down during spawn protection ??? heal instead
                 if (Date.now() < spawnProtectUntil) {
                     try {
                         player.restoreActorValue("health", 99999);
@@ -507,13 +1066,13 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
                     }
                     catch (eSend) { /* ignore */ }
                 }
-                // Do NOT use messageBox (modal freezes input — R key would not work)
+                // Do NOT use messageBox (modal freezes input ??? R key would not work)
                 try {
                     skyrimPlatform_4.Debug.notification("DOWNED! Press R for temple respawn (60s countdown).");
                 }
                 catch (e2) { /* ignore */ }
                 setDownedHud(secondsLeft());
-                skyrimPlatform_4.printConsole("VOA: DOWNED (" + (reason || "combat") + ") — press R for temple");
+                skyrimPlatform_4.printConsole("VOA: DOWNED (" + (reason || "combat") + ") ??? press R for temple");
             });
             exports_12("reviveLocal", reviveLocal = function (note) {
                 // Only clear local UX state; actual HP/isDead must come from server props
@@ -532,7 +1091,7 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
                     skyrimPlatform_4.Debug.notification(note || "You have been revived!");
                 }
                 catch (e2) { /* ignore */ }
-                skyrimPlatform_4.printConsole("VOA: REVIVED (local UX) — " + (note || "ok"));
+                skyrimPlatform_4.printConsole("VOA: REVIVED (local UX) ??? " + (note || "ok"));
             });
             // Prefer server _voaTempleRespawn; if server addon offline, local temple TP+heal.
             var TEMPLES = [
@@ -621,7 +1180,7 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
                 });
             };
             exports_12("requestTempleRespawn", requestTempleRespawn);
-            // Browser click → temple
+            // Browser click ??? temple
             try {
                 skyrimPlatform_4.on("browserMessage", function (e) {
                     try {
@@ -636,7 +1195,7 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
                 });
             }
             catch (eBm) { /* older SP */ }
-            // R key while downed → temple (always works even if CEF click fails)
+            // R key while downed ??? temple (always works even if CEF click fails)
             skyrimPlatform_4.on("update", function () {
                 if (!isDowned)
                     return;
@@ -700,11 +1259,11 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
                 catch (eD) {
                     engineDead = false;
                 }
-                // Enter downed when HP is gone OR engine marks dead — before real death menu
+                // Enter downed when HP is gone OR engine marks dead ??? before real death menu
                 if (!isDowned && (hp <= 0.02 || engineDead)) {
                     enterDowned(engineDead ? "isDead" : "health", sendFn);
                 }
-                // Server/local resurrected — HP came back (not just the 2% sliver we keep while downed)
+                // Server/local resurrected ??? HP came back (not just the 2% sliver we keep while downed)
                 if (isDowned && hp > 0.15 && !engineDead) {
                     isDowned = false;
                     downedSince = 0;
@@ -714,7 +1273,7 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
                         skyrimPlatform_4.Debug.notification("You rise again!");
                     }
                     catch (eR) { /* ignore */ }
-                    skyrimPlatform_4.printConsole("VOA: HP restored — clearing local downed");
+                    skyrimPlatform_4.printConsole("VOA: HP restored ??? clearing local downed");
                 }
                 if (isDowned) {
                     gAllowGetUp = false;
@@ -728,7 +1287,7 @@ System.register("skymp5-client/src/front/deathSystem", ["build/dist/client/Data/
                     if (Date.now() - lastNotify > 10000 && left > 0) {
                         lastNotify = Date.now();
                         try {
-                            skyrimPlatform_4.Debug.notification("Downed — " + left + "s — PRESS R for temple");
+                            skyrimPlatform_4.Debug.notification("Downed ??? " + left + "s ??? PRESS R for temple");
                         }
                         catch (e3) { /* ignore */ }
                     }
@@ -800,6 +1359,8 @@ System.register("skymp5-client/src/front/components/movementApply", ["build/dist
         ],
         execute: function () {
             exports_14("applyMovement", applyMovement = function (refr, m) {
+                // VOA: teleportIfNeed throws to signal FormView must destroy+respawn (stock SkyMP pattern).
+                // Must NOT become an uncaught [Exception] on the console.
                 if (teleportIfNeed(refr, m))
                     return;
                 translateTo(refr, m);
@@ -901,8 +1462,8 @@ System.register("skymp5-client/src/front/components/movementApply", ["build/dist
                 if (m.runMode !== "Standing")
                     time = 0.2;
                 var speed = distance / time;
-                // VOA: cap translate speed — failed movement packets + rehost caused
-                // huge distance/time ratios → animals zip around at "lightspeed"
+                // VOA: cap translate speed ??? failed movement packets + rehost caused
+                // huge distance/time ratios ??? animals zip around at "lightspeed"
                 if (speed > 600)
                     speed = 600;
                 if (distance > 512) {
@@ -928,8 +1489,16 @@ System.register("skymp5-client/src/front/components/movementApply", ["build/dist
                 }
             };
             teleportIfNeed = function (refr, m) {
-                if (isInDifferentWorldOrCell(refr, m.worldOrCell) ||
-                    (!refr.is3DLoaded() && isInDifferentExteriorCell(refr, m.pos))) {
+                try {
+                    if (isInDifferentWorldOrCell(refr, m.worldOrCell) ||
+                        (!refr.is3DLoaded() && isInDifferentExteriorCell(refr, m.pos))) {
+                        throw new Error("needs to be respawned");
+                    }
+                }
+                catch (eCell) {
+                    // Re-throw only the intentional respawn signal; swallow null world/cell races
+                    if (eCell && String(eCell).indexOf("needs to be respawned") !== -1)
+                        throw eCell;
                     throw new Error("needs to be respawned");
                 }
                 return false;
@@ -1384,6 +1953,11 @@ System.register("skymp5-client/src/front/components/look", ["build/dist/client/D
                 if (!npc)
                     throw new Error("createNpc returned null");
                 applyLookCommon(look, npc);
+                // VOA: hide true name on other-player clones; overhead plates reveal after "Give Name"
+                try {
+                    npc.setName(" ");
+                }
+                catch (eHide) { /* ignore */ }
                 return npc;
             });
             exports_18("applyLookToPlayer", applyLookToPlayer = function (look) {
@@ -1727,32 +2301,174 @@ System.register("skymp5-client/src/front/model", [], function (exports_21, conte
 });
 System.register("skymp5-client/src/front/worldCleaner", ["build/dist/client/Data/Platform/Modules/skyrimPlatform"], function (exports_22, context_22) {
     "use strict";
-    var skyrimPlatform_12, protection, isInDialogue;
+    var skyrimPlatform_12, protection, isUnsafeMenu, isMpProtectedForm, muteAndHide, stripActor, processOneActor, CLEAN_RADII, FINDS_BURST, FINDS_STEADY, BURST_MS, START_DELAY_MS, loggedOnce, hooksReady, strippedCount, lastStatus, liveSinceMs, radiusIdx, frameSkip, strippedIds, pendingAttachIds;
     var __moduleName = context_22 && context_22.id;
-    function processOneActor() {
+    /**
+     * VOA player-only: hide local vanilla NPCs/animals (client-side).
+     * CTD-safe mode (no disable / no setPosition — those race MovementControllerNPC).
+     * Soft only: AI off, ghost, alpha 0, scale down, no dialogue.
+     * cellAttach only queues IDs; all work runs on update after START_DELAY_MS.
+     */
+    function processOneActor(radius) {
         var pc = skyrimPlatform_12.Game.getPlayer();
-        var actor = skyrimPlatform_12.Game.findRandomActor(pc.getPositionX(), pc.getPositionY(), pc.getPositionZ(), 8192);
-        var actorId = actor.getFormID();
-        var currentProtection = protection.get(actorId);
-        if (currentProtection > 0)
+        if (!pc)
             return;
-        if (!actor || actorId === 0x14 || actor.isDisabled() || actor.isDeleted())
+        var actor = skyrimPlatform_12.Game.findRandomActor(pc.getPositionX(), pc.getPositionY(), pc.getPositionZ(), radius);
+        if (!actor)
             return;
-        if (isInDialogue(actor)) {
-            // Deleting actor in dialogue crashes Skyrim
-            // https://github.com/skyrim-multiplayer/issue-tracker/issues/13
-            actor.setPosition(0, 0, 0);
+        var actorId = 0;
+        try {
+            actorId = actor.getFormID();
+        }
+        catch (eId) {
             return;
         }
-        actor.disable(false).then(function () {
-            var ac = skyrimPlatform_12.Actor.from(skyrimPlatform_12.Game.getFormEx(actorId));
-            if (!ac || isInDialogue(ac))
+        if (!actorId || actorId === 0x14 || actorId === 0x100014)
+            return;
+        if (isMpProtectedForm(actorId))
+            return;
+        if ((protection.get(actorId) || 0) > 0)
+            return;
+        try {
+            if (actor.isDeleted())
                 return;
-            ac.delete();
-        });
+        }
+        catch (eChk) {
+            return;
+        }
+        stripActor(actor, actorId);
+    }
+    function processPendingAttaches(budget) {
+        if (!pendingAttachIds || !pendingAttachIds.length)
+            return;
+        var n = Math.min(budget, pendingAttachIds.length);
+        for (var i = 0; i < n; i++) {
+            var id = pendingAttachIds.shift();
+            if (!id)
+                continue;
+            if (isMpProtectedForm(id))
+                continue;
+            if ((protection.get(id) || 0) > 0)
+                continue;
+            try {
+                var form = skyrimPlatform_12.Game.getFormEx(id);
+                if (!form)
+                    continue;
+                var ac = skyrimPlatform_12.Actor.from(form);
+                if (!ac)
+                    continue;
+                stripActor(ac, id);
+            }
+            catch (eP) { }
+        }
     }
     function updateWc() {
-        return processOneActor();
+        if (isUnsafeMenu()) {
+            liveSinceMs = 0;
+            return;
+        }
+        var now = Date.now();
+        if (!liveSinceMs)
+            liveSinceMs = now;
+        // Wait after load settles before touching any actor (join CTD window)
+        if (now - liveSinceMs < START_DELAY_MS)
+            return;
+        if (!loggedOnce) {
+            loggedOnce = true;
+            try {
+                skyrimPlatform_12.printConsole("VOA: world cleaner ACTIVE (soft mute only, no disable)");
+            }
+            catch (e) { }
+        }
+        if (!hooksReady) {
+            hooksReady = true;
+            try {
+                skyrimPlatform_12.on("cellAttach", function (e) {
+                    try {
+                        // Never strip inside cellAttach callback (engine mid-attach = CTD).
+                        // Queue form id for next update ticks.
+                        if (!e || !e.refr)
+                            return;
+                        var id = 0;
+                        try {
+                            id = e.refr.getFormID();
+                        }
+                        catch (eId) {
+                            return;
+                        }
+                        if (!id || id === 0x14 || id === 0x100014)
+                            return;
+                        if (isMpProtectedForm(id))
+                            return;
+                        if ((protection.get(id) || 0) > 0)
+                            return;
+                        if (pendingAttachIds.length < 400)
+                            pendingAttachIds.push(id);
+                    }
+                    catch (eAtt) { }
+                });
+            }
+            catch (eCell) { }
+            try {
+                skyrimPlatform_12.on("menuOpen", function (e) {
+                    try {
+                        if (!e || e.name !== "Dialogue Menu")
+                            return;
+                        if (isUnsafeMenu())
+                            return;
+                        try {
+                            skyrimPlatform_12.Ui.closeMenu("Dialogue Menu");
+                        }
+                        catch (eClose) { }
+                        var pc = skyrimPlatform_12.Game.getPlayer();
+                        if (pc) {
+                            try {
+                                var dt = pc.getDialogueTarget();
+                                if (dt) {
+                                    var ac = skyrimPlatform_12.Actor.from(dt);
+                                    if (ac)
+                                        stripActor(ac, ac.getFormID());
+                                }
+                            }
+                            catch (eDt) { }
+                        }
+                    }
+                    catch (eMenu) { }
+                });
+            }
+            catch (eHook) { }
+            try {
+                skyrimPlatform_12.printConsole("VOA: player-only soft-mute ON (no disable/setPos)");
+            }
+            catch (eLog) { }
+        }
+        try {
+            if (skyrimPlatform_12.Ui.isMenuOpen("Dialogue Menu")) {
+                try {
+                    skyrimPlatform_12.Ui.closeMenu("Dialogue Menu");
+                }
+                catch (eC2) { }
+            }
+        }
+        catch (eDlg) { }
+        processPendingAttaches(12);
+        var inBurst = (now - liveSinceMs) < (START_DELAY_MS + BURST_MS);
+        frameSkip++;
+        if (!inBurst && frameSkip % 3 === 0)
+            return;
+        var budget = inBurst ? FINDS_BURST : FINDS_STEADY;
+        for (var i = 0; i < budget; i++) {
+            var radius = CLEAN_RADII[radiusIdx % CLEAN_RADII.length];
+            radiusIdx++;
+            processOneActor(radius);
+        }
+        if (now - lastStatus > 15000) {
+            lastStatus = now;
+            try {
+                skyrimPlatform_12.printConsole("VOA: world cleaner soft-muted ~" + strippedCount + " locals");
+            }
+            catch (e2) { }
+        }
     }
     exports_22("updateWc", updateWc);
     function modWcProtection(actorId, mod) {
@@ -1768,8 +2484,109 @@ System.register("skymp5-client/src/front/worldCleaner", ["build/dist/client/Data
         ],
         execute: function () {
             protection = new Map();
-            isInDialogue = function (ac) {
-                return ac.isInDialogueWithPlayer() || !!ac.getDialogueTarget();
+            strippedIds = new Map();
+            pendingAttachIds = [];
+            CLEAN_RADII = [1024, 2048, 4096, 8192, 16384, 32768];
+            FINDS_BURST = 24;
+            FINDS_STEADY = 12;
+            BURST_MS = 30000;
+            // After load menus close, wait before any actor touch
+            START_DELAY_MS = 10000;
+            loggedOnce = false;
+            hooksReady = false;
+            strippedCount = 0;
+            lastStatus = 0;
+            liveSinceMs = 0;
+            radiusIdx = 0;
+            frameSkip = 0;
+            isUnsafeMenu = function () {
+                try {
+                    return !!(skyrimPlatform_12.Ui.isMenuOpen("Loading Menu") ||
+                        skyrimPlatform_12.Ui.isMenuOpen("Main Menu") ||
+                        skyrimPlatform_12.Ui.isMenuOpen("RaceSex Menu"));
+                }
+                catch (e) {
+                    return true;
+                }
+            };
+            isMpProtectedForm = function (actorId) {
+                var id = actorId >>> 0;
+                if (id >= 0xff000000)
+                    return true;
+                return false;
+            };
+            // Soft only — NEVER disable() or setPosition (MovementController CTD)
+            muteAndHide = function (actor) {
+                try {
+                    if (typeof actor.allowPCDialogue === "function")
+                        actor.allowPCDialogue(false);
+                }
+                catch (e1) { }
+                try {
+                    if (typeof actor.allowBleedoutDialogue === "function")
+                        actor.allowBleedoutDialogue(false);
+                }
+                catch (e2) { }
+                try {
+                    if (typeof actor.enableAI === "function")
+                        actor.enableAI(false);
+                }
+                catch (e3) { }
+                try {
+                    if (typeof actor.setRestrained === "function")
+                        actor.setRestrained(true);
+                }
+                catch (e4) { }
+                try {
+                    if (typeof actor.setGhost === "function")
+                        actor.setGhost(true);
+                }
+                catch (e5) { }
+                try {
+                    if (typeof actor.blockActivation === "function")
+                        actor.blockActivation(true);
+                }
+                catch (e6) { }
+                try {
+                    if (typeof actor.stopCombat === "function")
+                        actor.stopCombat();
+                }
+                catch (e7) { }
+                try {
+                    if (typeof actor.clearLookAt === "function")
+                        actor.clearLookAt();
+                }
+                catch (e8) { }
+                try {
+                    if (typeof actor.setAlpha === "function")
+                        actor.setAlpha(0);
+                }
+                catch (e9) { }
+                try {
+                    if (typeof actor.setScale === "function")
+                        actor.setScale(0.01);
+                }
+                catch (e10) { }
+            };
+            stripActor = function (actor, actorId) {
+                if (!actor || !actorId)
+                    return;
+                if (isMpProtectedForm(actorId))
+                    return;
+                if ((protection.get(actorId) || 0) > 0)
+                    return;
+                try {
+                    var already = strippedIds.get(actorId);
+                    var now = Date.now();
+                    // Re-apply soft mute every 4s (engine re-enables AI)
+                    if (already && now - already < 4000)
+                        return;
+                    muteAndHide(actor);
+                    if (!already)
+                        strippedCount++;
+                    strippedIds.set(actorId, now);
+                }
+                catch (eAll) { }
             };
         }
     };
@@ -1810,6 +2627,9 @@ System.register("skymp5-client/src/front/view", ["build/dist/client/Data/Platfor
         var isMovableStatic = t === 36;
         var isNpc = t === 43;
         var isDoor = t === 29;
+        // Stock SkyMP: block doors so cell travel is server-authoritative.
+        // Local door travel races the server Teleport packet and loses the
+        // once("update") callback during Loading Menu (stuck outside / no TP).
         if (isContainer || isItem(t) || isIngredientSource || isNpc || isDoor) {
             ref.blockActivation(true);
         }
@@ -1882,7 +2702,10 @@ System.register("skymp5-client/src/front/view", ["build/dist/client/Data/Platfor
             getFormEx = skyrimPlatform_13.Game.getFormEx;
             lastTryHost = {};
             tryHostIfNeed = function (ac, remoteId) {
-                // VOA: host attempts were 1/s per actor → NPC enable/disable thrash ("fading")
+                // VOA player-only: never host vanilla cell actors (animals/NPCs) ??? only MP dynamic forms
+                if (!remoteId || (remoteId >>> 0) < 0xff000000)
+                    return;
+                // VOA: host attempts were 1/s per actor ??? NPC enable/disable thrash ("fading")
                 // Only retry every 12s, and skip if already hosting this remote id.
                 var last = lastTryHost[remoteId];
                 if (last && Date.now() - last < 12000)
@@ -2033,6 +2856,22 @@ System.register("skymp5-client/src/front/view", ["build/dist/client/Data/Platfor
                             this.lookState.lastNumChanges = model.numLookChanges;
                             this.lookBasedBaseId = 0;
                         }
+                        // VOA: remember true name for plates / reveal (hidden on actor base)
+                        try {
+                            if (model.look.name && this.remoteRefrId && this.remoteRefrId >= 0xff000000) {
+                                if (typeof skyrimPlatform_13.storage._voaOnPlayerLook === "function")
+                                    skyrimPlatform_13.storage._voaOnPlayerLook(this.remoteRefrId, model.look.name);
+                                else {
+                                    var tn = skyrimPlatform_13.storage["voaTrueNames"];
+                                    if (!tn || typeof tn !== "object") {
+                                        tn = {};
+                                        skyrimPlatform_13.storage["voaTrueNames"] = tn;
+                                    }
+                                    tn[this.remoteRefrId] = String(model.look.name);
+                                }
+                            }
+                        }
+                        catch (eName) { /* ignore */ }
                     }
                     var refId = model.refrId && model.refrId < 0xff000000 ? model.refrId : undefined;
                     if (refId) {
@@ -2240,7 +3079,7 @@ System.register("skymp5-client/src/front/view", ["build/dist/client/Data/Platfor
                                 }
                             }
                         }
-                        // VOA: only rehost after long silence (was 1.5s/1s → animals flicker)
+                        // VOA: only rehost after long silence (was 1.5s/1s ??? animals flicker)
                         if (this.movState.lastApply &&
                             Date.now() - this.movState.lastApply > 8000) {
                             if (Date.now() - this.movState.lastRehost > 12000) {
@@ -2260,10 +3099,24 @@ System.register("skymp5-client/src/front/view", ["build/dist/client/Data/Platfor
                                 if (forcedWeapDrawn === true || forcedWeapDrawn === false) {
                                     model.movement.isWeapDrawn = forcedWeapDrawn;
                                 }
-                                movement_1.applyMovement(refr, model.movement);
-                                model.movement.isWeapDrawn = backup;
-                                this.movState.lastNumChanges = +model.numMovementChanges;
-                                this.movState.everApplied = true;
+                                try {
+                                    movement_1.applyMovement(refr, model.movement);
+                                    model.movement.isWeapDrawn = backup;
+                                    this.movState.lastNumChanges = +model.numMovementChanges;
+                                    this.movState.everApplied = true;
+                                }
+                                catch (eMov) {
+                                    model.movement.isWeapDrawn = backup;
+                                    // Stock SkyMP: cell mismatch ??? destroy FormView so next update respawns cleanly
+                                    if (String(eMov).indexOf("needs to be respawned") !== -1) {
+                                        this.destroy();
+                                        this.refrId = 0;
+                                        this.lookBasedBaseId = 0;
+                                        this.ready = false;
+                                        return;
+                                    }
+                                    throw eMov;
+                                }
                             }
                             else {
                                 if (ac)
@@ -2465,7 +3318,7 @@ System.register("skymp5-client/src/front/view", ["build/dist/client/Data/Platfor
                         // Wait 1s game time (time spent in Race Menu isn't counted)
                         skyrimPlatform_13.Utility.wait(1).then(function () {
                             _this.allowUpdate = true;
-                            skyrimPlatform_13.printConsole("Update is now allowed");
+                            skyrimPlatform_13.printConsole("Update is now allowed"); try { skyrimPlatform_13.storage["voaChatUiAllowed"] = true; } catch (eChatUi) {}
                         });
                     });
                 }
@@ -2575,28 +3428,62 @@ System.register("skymp5-client/src/front/networking", ["build/dist/client/Data/P
             lastPort = 0;
             createClientSafe = function (hostname, port) {
                 sp.printConsole("createClientSafe " + hostname + ":" + port);
-                // Client sometimes call this function with bad parameters.
-                // It causes assertion failure in Debug mode, but doesn't lead to anything on a regular player's machine.
-                // It seems that this function will be called with the valid parameters later
-                if (hostname !== "" && lastPort !== 0) {
+                // VOA: use the port argument (not only lastPort) so first connect always fires
+                if (hostname !== "" && port !== 0) {
+                    try {
+                        skyrimPlatform_14.mpClientPlugin.destroyClient();
+                    }
+                    catch (e) { }
                     skyrimPlatform_14.mpClientPlugin.createClient(hostname, port);
                 }
             };
             sp.on("tick", function () {
-                skyrimPlatform_14.mpClientPlugin.tick(function (packetType, jsonContent, error) {
-                    var handlers = handlersMap.get(packetType) || [];
-                    handlers.forEach(function (handler) {
-                        var parse = function () {
+                // VOA: wrap native tick ??? MpClientPlugin can throw nlohmann
+                // [json.exception.out_of_range.403] key 'refrId' not found when the server
+                // emits UpdateProperty without refrId (door isOpen). Without this catch,
+                // door traffic can leave the client in a bad state.
+                try {
+                    skyrimPlatform_14.mpClientPlugin.tick(function (packetType, jsonContent, error) {
+                        var handlers = handlersMap.get(packetType) || [];
+                        handlers.forEach(function (handler) {
                             try {
-                                return JSON.parse(jsonContent);
+                                var parse = function () {
+                                    try {
+                                        return JSON.parse(jsonContent);
+                                    }
+                                    catch (e) {
+                                        var preview = (jsonContent && jsonContent.length > 180) ? (jsonContent.slice(0, 180) + "???") : jsonContent;
+                                        skyrimPlatform_14.printConsole("VOA: bad packet JSON (" + packetType + "): " + e + " body=" + preview);
+                                        return null;
+                                    }
+                                };
+                                if (!jsonContent || !jsonContent.length) {
+                                    handler(error);
+                                    return;
+                                }
+                                var parsed = parse();
+                                if (parsed)
+                                    handler(parsed);
                             }
-                            catch (e) {
-                                throw new Error("JSON " + jsonContent + " failed to parse: " + e);
+                            catch (eTick) {
+                                try {
+                                    skyrimPlatform_14.printConsole("VOA: packet handler error: " + eTick);
+                                }
+                                catch (e2) { /* ignore */ }
                             }
-                        };
-                        handler(jsonContent.length ? parse() : error);
+                        });
                     });
-                });
+                }
+                catch (eNativeTick) {
+                    try {
+                        var nowT = Date.now();
+                        if (!sp._voaLastTickErr || nowT - sp._voaLastTickErr > 3000) {
+                            sp._voaLastTickErr = nowT;
+                            skyrimPlatform_14.printConsole("VOA: mpClientPlugin.tick threw: " + eNativeTick);
+                        }
+                    }
+                    catch (_t) { /* ignore */ }
+                }
             });
             exports_26("connect", connect = function (hostname, port) {
                 lastHostname = hostname;
@@ -2652,6 +3539,22 @@ System.register("skymp5-client/src/front/networking", ["build/dist/client/Data/P
                             data: dataOut,
                         };
                     }
+                    // VOA: rebuild Activate so data is always complete (doors / containers).
+                    if (msg && tNum === 6) {
+                        var aSrc = (msg.data && typeof msg.data === "object") ? msg.data : {};
+                        var actiOut = {
+                            t: 6,
+                            data: {
+                                caster: Number(aSrc.caster) || 0,
+                                target: Number(aSrc.target) || 0,
+                                isSecondActivation: aSrc.isSecondActivation === true,
+                            },
+                        };
+                        if (typeof msg.idx === "number" || (msg.idx != null && msg.idx !== "")) {
+                            actiOut.idx = typeof msg.idx === "number" ? msg.idx : Number(msg.idx) || 0;
+                        }
+                        msg = actiOut;
+                    }
                 }
                 catch (_s) { /* ignore */ }
                 var payload = JSON.stringify(msg);
@@ -2659,9 +3562,23 @@ System.register("skymp5-client/src/front/networking", ["build/dist/client/Data/P
                 if (msg && (msg.t === 2 || msg.t === "2") && payload.indexOf('"isDead"') === -1) {
                     payload = payload.replace(/"data"\s*:\s*\{/, '"data":{"isDead":false,');
                 }
-                skyrimPlatform_14.mpClientPlugin.send(payload, reliable);
+                try {
+                    skyrimPlatform_14.mpClientPlugin.send(payload, reliable);
+                }
+                catch (eSend) {
+                    // Native MpClientPlugin can throw nlohmann out_of_range (e.g. missing keys).
+                    // Swallow so one bad packet (door Activate / property echo) never freezes input.
+                    try {
+                        var nowS = Date.now();
+                        if (!send._voaLastSendErr || nowS - send._voaLastSendErr > 2000) {
+                            send._voaLastSendErr = nowS;
+                            skyrimPlatform_14.printConsole("VOA: mpClientPlugin.send threw: " + eSend + " t=" + (msg && msg.t));
+                        }
+                    }
+                    catch (_e2) { /* ignore */ }
+                }
             });
-            // Reconnect with backoff — tight reconnect loops freeze Skyrim (black screen / unresponsive)
+            // Reconnect with backoff ??? tight reconnect loops freeze Skyrim (black screen / unresponsive)
             var reconnectAttempts = 0;
             var reconnectTimer = 0;
             var maxReconnectAttempts = 8;
@@ -2669,7 +3586,7 @@ System.register("skymp5-client/src/front/networking", ["build/dist/client/Data/P
                 if (!lastHostname)
                     return;
                 if (reconnectAttempts >= maxReconnectAttempts) {
-                    skyrimPlatform_14.printConsole("VOA: stopped reconnecting after " + maxReconnectAttempts + " attempts — check server/session/settings");
+                    skyrimPlatform_14.printConsole("VOA: stopped reconnecting after " + maxReconnectAttempts + " attempts ??? check server/session/settings");
                     return;
                 }
                 var now = Date.now();
@@ -2927,7 +3844,7 @@ System.register("skymp5-client/src/front/components/actorvalues", [], function (
 });
 System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/front/networking", "skymp5-client/src/front/messages", "build/dist/client/Data/Platform/Modules/skyrimPlatform", "skymp5-client/src/front/loadGameManager", "skymp5-client/src/front/components/inventory", "skymp5-client/src/front/components/equipment", "skymp5-client/src/lib/idManager", "skymp5-client/src/front/components/look", "skymp5-client/src/front/spSnippet", "skymp5-client/src/front/view", "skymp5-client/src/front/updateOwner", "skymp5-client/src/front/components/actorvalues"], function (exports_32, context_32) {
     "use strict";
-    var networking, messages, skyrimPlatform_15, loadGameManager, inventory_3, equipment_2, idManager_1, look_2, spSnippet, sp, view_2, updateOwner, actorvalues_1, setupEventSource, maxVerifyDelayDefault, verifyStartMoment, loggingStartMoment, maxVerifyDelay, SpawnTask, sendBrowserToken, verifySourceCode, loginWithSkympIoCredentials, taskVerifySourceCode, getPcInventory, setPcInventory, pcInvLastApply, RemoteServer;
+    var networking, messages, skyrimPlatform_15, loadGameManager, inventory_3, equipment_2, idManager_1, look_2, spSnippet, sp, view_2, updateOwner, actorvalues_1, setupEventSource, maxVerifyDelayDefault, verifyStartMoment, loggingStartMoment, maxVerifyDelay, loginAttempted, SpawnTask, sendBrowserToken, verifySourceCode, loginWithSkympIoCredentials, taskVerifySourceCode, getPcInventory, setPcInventory, pcInvLastApply, RemoteServer;
     var __moduleName = context_32 && context_32.id;
     return {
         setters: [
@@ -2994,15 +3911,16 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
             //
             //
             //
-            maxVerifyDelayDefault = 8000;
+            maxVerifyDelayDefault = 3000;
             verifyStartMoment = 0;
             loggingStartMoment = 0;
             maxVerifyDelay = maxVerifyDelayDefault;
+            loginAttempted = false;
             skyrimPlatform_15.on("tick", function () {
-                var maxLoggingDelay = 12000;
+                var maxLoggingDelay = 90000;
                 // VOA: if server is slow/recovering, skip verify and login with session instead of reconnect storm
                 if (verifyStartMoment && Date.now() - verifyStartMoment > maxVerifyDelay) {
-                    skyrimPlatform_15.printConsole("VOA: verify timeout — logging in with session credentials");
+                    skyrimPlatform_15.printConsole("VOA: verify timeout ??? logging in with session credentials");
                     verifyStartMoment = 0;
                     maxVerifyDelay = maxVerifyDelayDefault;
                     try {
@@ -3014,8 +3932,10 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                     }
                 }
                 if (loggingStartMoment && Date.now() - loggingStartMoment > maxLoggingDelay) {
-                    skyrimPlatform_15.printConsole("VOA: login timed out — will retry with backoff (not immediate reconnect)");
+                    skyrimPlatform_15.printConsole("VOA: login timed out ??? will retry with backoff (not immediate reconnect)");
                     loggingStartMoment = 0;
+                    loginAttempted = false;
+                    try { skyrimPlatform_15.storage["voaLoggingIn"] = 0; } catch (eClr) { /* ignore */ }
                     networking.reconnect();
                 }
             });
@@ -3047,13 +3967,27 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                 }, true);
             };
             loginWithSkympIoCredentials = function () {
+                if (loginAttempted && loggingStartMoment) {
+                    skyrimPlatform_15.printConsole("VOA: login already in flight ??? skip duplicate");
+                    return;
+                }
+                loginAttempted = true;
                 loggingStartMoment = Date.now();
-                skyrimPlatform_15.printConsole("Logging in as skymp.io user");
+                try {
+                    skyrimPlatform_15.storage["voaLoggingIn"] = loggingStartMoment;
+                }
+                catch (eSt) { /* ignore */ }
+                var gd = null;
+                try {
+                    gd = skyrimPlatform_15.settings["skymp5-client"]["gameData"];
+                }
+                catch (eGd) { gd = null; }
+                skyrimPlatform_15.printConsole("Logging in as skymp.io user profileId=" + (gd && gd.profileId));
                 networking.send({
                     t: messages.MsgType.CustomPacket,
                     content: {
                         customPacketType: "loginWithSkympIo",
-                        gameData: skyrimPlatform_15.settings["skymp5-client"]["gameData"],
+                        gameData: gd,
                     },
                 }, true);
             };
@@ -3126,7 +4060,11 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                                                 case 4:
                                                     networking.send({
                                                         t: messages.MsgType.Activate,
-                                                        data: { caster: 0x14, target: msg.target },
+                                                        data: {
+                                                            caster: 0x14,
+                                                            target: msg.target,
+                                                            isSecondActivation: false,
+                                                        },
                                                     }, true);
                                                     return [2 /*return*/];
                                             }
@@ -3137,18 +4075,179 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                         });
                     }); });
                 };
-                RemoteServer.prototype.teleport = function (msg) {
-                    skyrimPlatform_15.once("update", function () {
-                        skyrimPlatform_15.printConsole("Teleporting...", msg.pos, "cell/world is", msg.worldOrCell.toString(16));
-                        skyrimPlatform_15.TESModPlatform.moveRefrToPosition(skyrimPlatform_15.Game.getPlayer(), skyrimPlatform_15.Cell.from(skyrimPlatform_15.Game.getFormEx(msg.worldOrCell)), skyrimPlatform_15.WorldSpace.from(skyrimPlatform_15.Game.getFormEx(msg.worldOrCell)), msg.pos[0], msg.pos[1], msg.pos[2], msg.rot[0], msg.rot[1], msg.rot[2]);
-                        skyrimPlatform_15.Utility.wait(0.2).then(function () {
-                            skyrimPlatform_15.Game.getPlayer().setAngle(msg.rot[0], msg.rot[1], msg.rot[2]);
-                        });
+                // VOA: reliable door/cell teleports ??? once("update") dies during Loading Menu.
+                // Queue pending TP and re-apply via loadGame / moveRefr with retries until cell matches.
+                var applyVoaPendingTeleport = function (reason) {
+                    try {
+                        var tp = skyrimPlatform_15.storage["voaPendingTeleport"];
+                        if (!tp || tp.done)
+                            return;
+                        if (Date.now() - tp.at > 25000) {
+                            skyrimPlatform_15.printConsole("VOA: teleport expired after 25s");
+                            skyrimPlatform_15.storage["voaPendingTeleport"] = null;
+                            return;
+                        }
+                        // Don't thrash while loading menu is open (except first attempt)
+                        try {
+                            if (tp.tries > 0 && skyrimPlatform_15.Ui.isMenuOpen("Loading Menu"))
+                                return;
+                        }
+                        catch (eL) { /* ignore */ }
+                        var now = Date.now();
+                        if (tp.lastTryAt && now - tp.lastTryAt < 400)
+                            return;
+                        tp.lastTryAt = now;
+                        tp.tries = (tp.tries || 0) + 1;
+                        var player = skyrimPlatform_15.Game.getPlayer();
+                        if (!player)
+                            return;
+                        var curWoc = 0;
+                        try {
+                            var woc = player.getWorldSpace() || player.getParentCell();
+                            curWoc = woc ? woc.getFormID() : 0;
+                        }
+                        catch (eW) { /* ignore */ }
+                        var targetWoc = Number(tp.worldOrCell) || 0;
+                        var dx = player.getPositionX() - tp.pos[0];
+                        var dy = player.getPositionY() - tp.pos[1];
+                        var dz = player.getPositionZ() - tp.pos[2];
+                        var dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                        if (curWoc === targetWoc && dist < 256) {
+                            try {
+                                player.setAngle(tp.rot[0], tp.rot[1], tp.rot[2]);
+                            }
+                            catch (eA) { /* ignore */ }
+                            tp.done = true;
+                            skyrimPlatform_15.storage["voaPendingTeleport"] = null;
+                            skyrimPlatform_15.printConsole("VOA: teleport complete try=" + tp.tries + " reason=" + reason);
+                            return;
+                        }
+                        skyrimPlatform_15.printConsole("VOA: teleport apply try=" + tp.tries + " reason=" + reason +
+                            " cur=" + curWoc.toString(16) + " -> " + targetWoc.toString(16) + " dist=" + Math.round(dist));
+                        // Cross-cell: loadGame is reliable; same-cell: moveRefr is enough
+                        var needLoad = (curWoc !== targetWoc) || tp.tries <= 2 || tp.forceLoad;
+                        if (needLoad) {
+                            try {
+                                loadGameManager.loadGame(tp.pos, tp.rot, targetWoc);
+                                tp.forceLoad = false;
+                            }
+                            catch (eLg) {
+                                skyrimPlatform_15.printConsole("VOA: loadGame teleport failed: " + eLg);
+                                needLoad = false;
+                            }
+                        }
+                        if (!needLoad || tp.tries > 1) {
+                            try {
+                                skyrimPlatform_15.TESModPlatform.moveRefrToPosition(player, skyrimPlatform_15.Cell.from(skyrimPlatform_15.Game.getFormEx(targetWoc)), skyrimPlatform_15.WorldSpace.from(skyrimPlatform_15.Game.getFormEx(targetWoc)), tp.pos[0], tp.pos[1], tp.pos[2], tp.rot[0], tp.rot[1], tp.rot[2]);
+                            }
+                            catch (eMv) {
+                                skyrimPlatform_15.printConsole("VOA: moveRefr teleport failed: " + eMv);
+                            }
+                        }
+                        try {
+                            player.setAngle(tp.rot[0], tp.rot[1], tp.rot[2]);
+                        }
+                        catch (eA2) { /* ignore */ }
+                    }
+                    catch (eAll) {
+                        try {
+                            skyrimPlatform_15.printConsole("VOA: applyPendingTeleport err " + eAll);
+                        }
+                        catch (e2) { /* ignore */ }
+                    }
+                };
+                // Retry pending door/cell teleports every update (throttled inside)
+                if (!skyrimPlatform_15.storage["voaTpRetryHooked"]) {
+                    skyrimPlatform_15.storage["voaTpRetryHooked"] = true;
+                    skyrimPlatform_15.on("update", function () {
+                        applyVoaPendingTeleport("update");
                     });
+                    try {
+                        skyrimPlatform_15.on("menuClose", function (e) {
+                            var name = (e && (e.name || e.menuName)) || "";
+                            if (String(name) === "Loading Menu") {
+                                skyrimPlatform_15.printConsole("VOA: Loading Menu closed ??? reapply pending teleport");
+                                // Give engine a frame after load, then force loadGame if still wrong
+                                skyrimPlatform_15.once("update", function () {
+                                    var tp = skyrimPlatform_15.storage["voaPendingTeleport"];
+                                    if (tp && !tp.done)
+                                        tp.forceLoad = true;
+                                    applyVoaPendingTeleport("loading-close");
+                                });
+                            }
+                        });
+                    }
+                    catch (eMc) { /* older SP */ }
+                    try {
+                        skyrimPlatform_15.on("loadGame", function () {
+                            skyrimPlatform_15.once("update", function () {
+                                applyVoaPendingTeleport("loadGame");
+                            });
+                        });
+                    }
+                    catch (eLgH) { /* ignore */ }
+                }
+                RemoteServer.prototype.teleport = function (msg) {
+                    if (!msg || !msg.pos)
+                        return;
+                    var pending = {
+                        pos: [Number(msg.pos[0]) || 0, Number(msg.pos[1]) || 0, Number(msg.pos[2]) || 0],
+                        rot: Array.isArray(msg.rot)
+                            ? [Number(msg.rot[0]) || 0, Number(msg.rot[1]) || 0, Number(msg.rot[2]) || 0]
+                            : [0, 0, 0],
+                        worldOrCell: Number(msg.worldOrCell) || 0,
+                        at: Date.now(),
+                        tries: 0,
+                        lastTryAt: 0,
+                        done: false,
+                        forceLoad: true,
+                    };
+                    skyrimPlatform_15.storage["voaPendingTeleport"] = pending;
+                    skyrimPlatform_15.printConsole("Teleporting (queued)...", pending.pos, "cell/world is", pending.worldOrCell.toString(16));
+                    // Try immediately on next update; retries continue via hooks above
+                    skyrimPlatform_15.once("update", function () {
+                        applyVoaPendingTeleport("queue");
+                    });
+                    // Also schedule delayed retries that survive loading screen better than once-only
+                    try {
+                        skyrimPlatform_15.Utility.wait(0.5).then(function () { applyVoaPendingTeleport("wait-0.5"); });
+                        skyrimPlatform_15.Utility.wait(1.5).then(function () { applyVoaPendingTeleport("wait-1.5"); });
+                        skyrimPlatform_15.Utility.wait(3.0).then(function () {
+                            var tp = skyrimPlatform_15.storage["voaPendingTeleport"];
+                            if (tp && !tp.done)
+                                tp.forceLoad = true;
+                            applyVoaPendingTeleport("wait-3");
+                        });
+                    }
+                    catch (eW) { /* ignore */ }
                 };
                 RemoteServer.prototype.createActor = function (msg) {
                     var _this = this;
                     loggingStartMoment = 0;
+                    loginAttempted = false;
+                    try {
+                        skyrimPlatform_15.storage["voaLoggingIn"] = 0;
+                    }
+                    catch (eSt2) { /* ignore */ }
+                    if (!msg || !msg.transform || !msg.transform.pos) {
+                        skyrimPlatform_15.printConsole("VOA: createActor ABORT ??? missing transform " + (msg ? JSON.stringify(Object.keys(msg)) : "null"));
+                        return;
+                    }
+                    // VOA player-only: NEVER spawn server world actors (NPCs/animals/furniture ACHR).
+                    // Only self (isMe) or dynamic MP forms (0xff......). No exceptions for lookDump.
+                    var refrIdNum = (msg.refrId != null) ? Number(msg.refrId) : 0;
+                    if (!msg.isMe) {
+                        var ridU = refrIdNum >>> 0;
+                        if (!ridU || ridU < 0xff000000) {
+                            return;
+                        }
+                    }
+                    try {
+                        if (msg.isMe || (refrIdNum >>> 0) >= 0xff000000) {
+                            skyrimPlatform_15.printConsole("VOA: createActor idx=" + (msg && msg.idx) + " isMe=" + (msg && msg.isMe) + " refrId=" + (msg && msg.refrId) + " hasLook=" + !!(msg && msg.look));
+                        }
+                    }
+                    catch (eLog) { /* ignore */ }
                     var i = this.getIdManager().allocateIdFor(msg.idx);
                     if (this.worldModel.forms.length <= i)
                         this.worldModel.forms.length = i + 1;
@@ -3215,20 +4314,23 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                             skyrimPlatform_15.Utility.wait(1.0).then(function () {
                                 try {
                                     // Brief protect on every join (mudcrabs / wolves at spawn)
-                                    // deathSystem is loaded via view → available through storage bridge below
-                                    skyrimPlatform_15.storage["voaGrantSpawnProtect"] = Date.now() + 45000;
+                                    // deathSystem is loaded via view ??? available through storage bridge below
+                                    skyrimPlatform_15.storage["voaGrantSpawnProtect"] = Date.now() + 12000;
                                 }
                                 catch (eProt) { /* ignore */ }
                                 try {
-                                    skyrimPlatform_15.callNative("Game", "ShowAllMapMarkers", null, true);
+                                    // Papyrus Game.ShowAllMapMarkers(bool) ??? single bool arg via callNative
+                                    skyrimPlatform_15.callNative("Game", "ShowAllMapMarkers", true);
                                     skyrimPlatform_15.printConsole("VOA: ShowAllMapMarkers(true)");
                                 }
                                 catch (eMap) {
                                     try {
-                                        skyrimPlatform_15.callNative("Game", "ShowAllMapMarkers", true);
+                                        if (skyrimPlatform_15.Game && typeof skyrimPlatform_15.Game.showAllMapMarkers === "function") {
+                                            skyrimPlatform_15.Game.showAllMapMarkers(true);
+                                        }
                                     }
                                     catch (eMap2) {
-                                        skyrimPlatform_15.printConsole("VOA: ShowAllMapMarkers failed: " + eMap2);
+                                        // Non-fatal; map markers are optional
                                     }
                                 }
                             });
@@ -3256,12 +4358,21 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                                         eventName: "_voaCharacterName",
                                         args: [profileId, slot, msg.look.name],
                                     }, true);
-                                    skyrimPlatform_15.printConsole("VOA loaded name p" + profileId + " slot " + slot + " => " + msg.look.name);
+                                    skyrimPlatform_15.printConsole("VOA loaded name p" + profileId + " slot " + slot + " => " + msg.look.name + " refrId=" + (msg.refrId != null ? msg.refrId : "?"));
                                 }
                                 catch (e1) { }
                             });
                         }
                         catch (e2) { }
+                    }
+                    else if (msg.isMe) {
+                        // Help diagnose "wrong character on slot 2" ??? spawn without look = new/empty form
+                        try {
+                            var gd3 = skyrimPlatform_15.settings["skymp5-client"]["gameData"] || {};
+                            var slot3 = (typeof gd3.characterSlot === "number") ? gd3.characterSlot : 0;
+                            skyrimPlatform_15.printConsole("VOA: isMe spawn has NO look (slot " + slot3 + " refrId=" + (msg.refrId != null ? msg.refrId : "?") + ") ??? expect race menu or wrong actor");
+                        }
+                        catch (eNoLook) { /* ignore */ }
                     }
                     var applyPcInv = function () {
                         inventory_3.applyInventory(skyrimPlatform_15.Game.getPlayer(), msg.equipment
@@ -3325,31 +4436,55 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                                 if (!task_1.running) {
                                     task_1.running = true;
                                     skyrimPlatform_15.printConsole("Using loadGame to spawn player");
-                                    // Ignore brief disconnects for 45s after spawn (server restart / UI race)
-                                    _this._voaSpawnGraceUntil = Date.now() + 45000;
+                                    // No chat/NPC grace — server owns NPC policy + chat ready
+                                    _this._voaSpawnGraceUntil = 0;
+                                    try { skyrimPlatform_15.storage["voaSpawnGraceUntil"] = 0; } catch (eGr) {}
+                                    // Ensure CEF is not focused across loadGame
+                                    try {
+                                        skyrimPlatform_15.browser.setFocused(false);
+                                        skyrimPlatform_15.storage["voaChatFocused"] = false;
+                                        skyrimPlatform_15.storage["voaForceBrowser"] = false;
+                                    } catch (eBf) {}
                                     var skin = msg.look && (msg.look.skinColor != null ? msg.look.skinColor : msg.look.bodySkinColor);
                                     skyrimPlatform_15.printConsole("skinColorFromServer:", skin != null ? Number(skin).toString(16) : undefined);
-                                    loadGameManager.loadGame(msg.transform.pos, msg.transform.rot, msg.transform.worldOrCell, msg.look
-                                        ? {
-                                            name: msg.look.name,
-                                            raceId: msg.look.raceId,
-                                            face: {
-                                                hairColor: msg.look.hairColor,
-                                                bodySkinColor: skin,
-                                                headTextureSetId: msg.look.headTextureSetId,
-                                                headPartIds: msg.look.headpartIds || msg.look.headPartIds,
-                                                presets: msg.look.presets,
-                                            },
-                                        }
-                                        : undefined);
+                                    try {
+                                        loadGameManager.loadGame(msg.transform.pos, msg.transform.rot, msg.transform.worldOrCell, msg.look
+                                            ? {
+                                                name: msg.look.name,
+                                                raceId: msg.look.raceId,
+                                                face: {
+                                                    hairColor: msg.look.hairColor,
+                                                    bodySkinColor: skin,
+                                                    headTextureSetId: msg.look.headTextureSetId,
+                                                    headPartIds: msg.look.headpartIds || msg.look.headPartIds,
+                                                    presets: msg.look.presets,
+                                                },
+                                            }
+                                            : undefined);
+                                    } catch (eLgSpawn) {
+                                        try { skyrimPlatform_15.printConsole("VOA: loadGame spawn failed " + eLgSpawn); } catch (e2) {}
+                                    }
                                     skyrimPlatform_15.once("update", function () {
+                                        // Keep CEF unfocused after load
+                                        try { skyrimPlatform_15.browser.setFocused(false); } catch (eF2) {}
                                         applyPcInv();
-                                        skyrimPlatform_15.Utility.wait(0.3).then(applyPcInv);
+                                        skyrimPlatform_15.Utility.wait(0.5).then(applyPcInv);
                                         if (msg.look) {
-                                            look_2.applyLookToPlayer(msg.look);
-                                            if (msg.look.isFemale)
-                                                // Fix gender-specific walking anim
-                                                skyrimPlatform_15.Game.getPlayer().resurrect();
+                                            try {
+                                                look_2.applyLookToPlayer(msg.look);
+                                            } catch (eLook) {
+                                                try { skyrimPlatform_15.printConsole("VOA: applyLook failed " + eLook); } catch (e3) {}
+                                            }
+                                            // Delayed resurrect (immediate after loadGame = CTD risk)
+                                            if (msg.look.isFemale) {
+                                                skyrimPlatform_15.Utility.wait(3.0).then(function () {
+                                                    try {
+                                                        var pl = skyrimPlatform_15.Game.getPlayer();
+                                                        if (pl && !skyrimPlatform_15.Ui.isMenuOpen("Loading Menu"))
+                                                            pl.resurrect();
+                                                    } catch (eRes) {}
+                                                });
+                                            }
                                         }
                                     });
                                 }
@@ -3402,8 +4537,60 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                 };
                 RemoteServer.prototype.UpdateProperty = function (msg) {
                     var i = this.getIdManager().getId(msg.idx);
+                    if (!this.worldModel.forms[i])
+                        return;
                     this.worldModel.forms[i][msg.propName] =
                         msg.data;
+                    // VOA: healthPercentage / isDead from mp.set must apply to local PC + neighbor bars
+                    var prop = msg.propName;
+                    if (prop !== "healthPercentage" && prop !== "isDead")
+                        return;
+                    var selfUp = this;
+                    skyrimPlatform_15.once("update", function () {
+                        try {
+                            var isMeProp = selfUp.worldModel.playerCharacterFormIdx === i;
+                            var formP = selfUp.worldModel.forms[i];
+                            if (prop === "healthPercentage" && formP && formP.movement) {
+                                formP.movement.healthPercentage = msg.data;
+                            }
+                            if (isMeProp) {
+                                var pl = skyrimPlatform_15.Game.getPlayer();
+                                if (!pl)
+                                    return;
+                                try {
+                                    skyrimPlatform_15.storage["voaGrantSpawnProtect"] = 0;
+                                }
+                                catch (e0) { /* ignore */ }
+                                if (prop === "healthPercentage" && typeof msg.data === "number") {
+                                    actorvalues_1.setActorValuePercentage(pl, "health", msg.data);
+                                    skyrimPlatform_15.printConsole("VOA: UpdateProperty self health=" + msg.data);
+                                    if (msg.data <= 0.02) {
+                                        try {
+                                            pl.startDeferredKill();
+                                            pl.pushActorAway(pl, 0);
+                                        }
+                                        catch (eD) { /* ignore */ }
+                                    }
+                                }
+                                if (prop === "isDead" && msg.data) {
+                                    try {
+                                        pl.startDeferredKill();
+                                        pl.pushActorAway(pl, 0);
+                                    }
+                                    catch (eD2) { /* ignore */ }
+                                }
+                            }
+                            else if (formP && formP.refrId && prop === "healthPercentage" && typeof msg.data === "number") {
+                                var lid = view_2.remoteIdToLocalId(formP.refrId);
+                                var refrN = skyrimPlatform_15.Actor.from(skyrimPlatform_15.Game.getFormEx(lid));
+                                if (refrN)
+                                    actorvalues_1.setActorValuePercentage(refrN, "health", msg.data);
+                            }
+                        }
+                        catch (eUp) {
+                            skyrimPlatform_15.printConsole("VOA: UpdateProperty apply err " + eUp);
+                        }
+                    });
                 };
                 RemoteServer.prototype.handleConnectionAccepted = function () {
                     this.worldModel.forms = [];
@@ -3414,13 +4601,21 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                 RemoteServer.prototype.handleDisconnect = function () {
                 // VOA: server restarts / brief drops during spawn must NOT force main menu
                 try {
+                    // Flush character DB while player still exists in-world (forced close / link drop)
+                    try {
+                        if (skyrimPlatform_15.storage && skyrimPlatform_15.storage.remoteServer &&
+                            typeof skyrimPlatform_15.storage._voaForceCharSave === "function") {
+                            skyrimPlatform_15.storage._voaForceCharSave("handleDisconnect");
+                        }
+                    }
+                    catch (eSave) { /* ignore */ }
                     var now = Date.now();
                     var spawnGrace = this._voaSpawnGraceUntil || 0;
                     if (spawnGrace && now < spawnGrace) {
-                        skyrimPlatform_15.printConsole("VOA: disconnect during spawn grace — keeping world, will wait for reconnect");
+                        skyrimPlatform_15.printConsole("VOA: disconnect during spawn grace ??? keeping world, will wait for reconnect");
                         return;
                     }
-                    skyrimPlatform_15.printConsole("VOA: disconnected — returning to main menu (character saved on server)");
+                    skyrimPlatform_15.printConsole("VOA: disconnected ??? character state flushed, returning to main menu");
                     this.worldModel.forms = [];
                     this.worldModel.playerCharacterFormIdx = -1;
                     skyrimPlatform_15.once("update", function () {
@@ -3438,40 +4633,65 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                 var self = this;
                 skyrimPlatform_15.once("update", function () {
                     var data = msg.data || {};
-                    // VOA: apply to player or to hosted form by idx
                     var ac = skyrimPlatform_15.Game.getPlayer();
+                    var applyToActor = function (actor) {
+                        if (!actor) return;
+                        if (data.health != null) actorvalues_1.setActorValuePercentage(actor, "health", data.health);
+                        if (data.stamina != null) actorvalues_1.setActorValuePercentage(actor, "stamina", data.stamina);
+                        if (data.magicka != null) actorvalues_1.setActorValuePercentage(actor, "magicka", data.magicka);
+                    };
+                    // Resolve whether this ChangeValues is for *me* (server idx of our PC)
+                    var isForMe = false;
+                    var form = null;
                     if (typeof msg.idx === "number" && self.worldModel && self.worldModel.forms) {
                         try {
                             var i = self.getIdManager().getId(msg.idx);
-                            var form = self.worldModel.forms[i];
-                            if (form && form.movement) {
+                            form = self.worldModel.forms[i];
+                            if (form && form.movement && data.health != null) {
                                 form.movement.healthPercentage = data.health;
                             }
-                            var remoteId = form && form.refrId;
-                            if (remoteId) {
-                                var refr = skyrimPlatform_15.Actor.from(skyrimPlatform_15.Game.getFormEx(view_3.remoteIdToLocalId(remoteId)));
-                                if (refr) {
-                                    if (data.health != null) actorvalues_1.setActorValuePercentage(refr, "health", data.health);
-                                    if (data.stamina != null) actorvalues_1.setActorValuePercentage(refr, "stamina", data.stamina);
-                                    if (data.magicka != null) actorvalues_1.setActorValuePercentage(refr, "magicka", data.magicka);
-                                    // Remote players: visual only; real death is isDead property
-                                    return;
-                                }
+                            if (typeof self.worldModel.playerCharacterFormIdx === "number" &&
+                                self.worldModel.playerCharacterFormIdx === i) {
+                                isForMe = true;
                             }
-                        } catch (e) { skyrimPlatform_15.printConsole("ChangeValues remote: " + e); }
-                    }
-                    if (!ac) return;
-                    if (data.health != null) actorvalues_1.setActorValuePercentage(ac, "health", data.health);
-                    if (data.stamina != null) actorvalues_1.setActorValuePercentage(ac, "stamina", data.stamina);
-                    if (data.magicka != null) actorvalues_1.setActorValuePercentage(ac, "magicka", data.magicka);
-                    // VOA: health 0 = downed ragdoll (stay connected), not disconnect/kill
-                    if (data.health === 0 || data.health === 0.0) {
-                        try {
-                            // deathSystem may not be in scope here — use deferred kill + push
-                            ac.startDeferredKill();
-                            ac.pushActorAway(ac, 0);
                         }
-                        catch (e) { /* ignore */ }
+                        catch (eIdx) { /* ignore */ }
+                    }
+                    // No idx / unknown ??? treat as self (stock SkyMP path)
+                    if (typeof msg.idx !== "number")
+                        isForMe = true;
+
+                    if (isForMe) {
+                        // Server authority: cancel soft spawn-heal so damage sticks
+                        try {
+                            skyrimPlatform_15.storage["voaGrantSpawnProtect"] = 0;
+                        }
+                        catch (eSp) { /* ignore */ }
+                        applyToActor(ac);
+                        skyrimPlatform_15.printConsole("VOA: ChangeValues self health=" + data.health);
+                        if (data.health === 0 || data.health === 0.0 || (typeof data.health === "number" && data.health <= 0.02)) {
+                            try {
+                                ac.startDeferredKill();
+                                ac.pushActorAway(ac, 0);
+                            }
+                            catch (e) { /* ignore */ }
+                        }
+                        return;
+                    }
+
+                    // Neighbor / remote form visual HP bar
+                    if (form && form.refrId) {
+                        try {
+                            var localId = view_2.remoteIdToLocalId(form.refrId);
+                            var refr = skyrimPlatform_15.Actor.from(skyrimPlatform_15.Game.getFormEx(localId));
+                            if (refr) {
+                                applyToActor(refr);
+                                return;
+                            }
+                        }
+                        catch (eRem) {
+                            skyrimPlatform_15.printConsole("ChangeValues remote: " + eRem);
+                        }
                     }
                 });
             };
@@ -3674,7 +4894,7 @@ System.register("skymp5-client/src/front/remoteServer", ["skymp5-client/src/fron
                         networking.send(msg, reliable);
                     }
                     catch (e) {
-                        // Throttle spam — was flooding console and freezing frames
+                        // Throttle spam ??? was flooding console and freezing frames
                         var nowE = Date.now();
                         if (!this._voaLastSendErr || nowE - this._voaLastSendErr > 3000) {
                             this._voaLastSendErr = nowE;
@@ -3790,9 +5010,18 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
         ],
         execute: function () {
             handleMessage = function (msgAny, handler_) {
-                var msgType = msgAny.type || messages_3.MsgType[msgAny.t];
+                try {
+                var msgType = msgAny && (msgAny.type || messages_3.MsgType[msgAny.t]);
                 var handler = handler_;
-                var f = handler[msgType];
+                var f = handler && handler[msgType];
+                // VOA: while waiting for spawn, log every inbound message type (helps diagnose login stuck)
+                try {
+                    var loggingIn = skyrimPlatform_16.storage["voaLoggingIn"];
+                    if (loggingIn && msgType && msgType !== "UpdateMovement") {
+                        skyrimPlatform_16.printConsole("VOA: rx during login: " + msgType + (msgAny && msgAny.isMe ? " isMe" : "") + (f ? "" : " (NO HANDLER)"));
+                    }
+                }
+                catch (eRx) { /* ignore */ }
                 /*if (msgType !== "UpdateMovement") {
                   printConsole();
                   for (const key in msgAny) {
@@ -3826,6 +5055,16 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                 }
                 if (f && typeof f === "function")
                     handler[msgType](msgAny);
+                else if (msgType && msgType !== "UpdateMovement" && skyrimPlatform_16.storage["voaLoggingIn"]) {
+                    skyrimPlatform_16.printConsole("VOA: unhandled msg type during login: " + msgType);
+                }
+                }
+                catch (eHm) {
+                    try {
+                        skyrimPlatform_16.printConsole("VOA: handleMessage error: " + eHm + " stack=" + (eHm && eHm.stack));
+                    }
+                    catch (e2) { /* ignore */ }
+                }
             };
             for (var i = 0; i < 100; ++i)
                 skyrimPlatform_16.printConsole();
@@ -3833,15 +5072,11 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
             skyrimPlatform_16.printConsole("settings:", skyrimPlatform_16.settings["skymp5-client"]);
             targetIp = skyrimPlatform_16.settings["skymp5-client"]["server-ip"];
             targetPort = skyrimPlatform_16.settings["skymp5-client"]["server-port"];
-            if (skyrimPlatform_16.storage.targetIp !== targetIp || skyrimPlatform_16.storage.targetPort !== targetPort) {
-                skyrimPlatform_16.storage.targetIp = targetIp;
-                skyrimPlatform_16.storage.targetPort = targetPort;
-                skyrimPlatform_16.printConsole("Connecting to " + skyrimPlatform_16.storage.targetIp + ":" + skyrimPlatform_16.storage.targetPort);
-                networking.connect(targetIp, targetPort);
-            }
-            else {
-                skyrimPlatform_16.printConsole("Reconnect is not required");
-            }
+            // VOA: always connect on plugin load (storage skip left players stuck on main menu)
+            skyrimPlatform_16.storage.targetIp = targetIp;
+            skyrimPlatform_16.storage.targetPort = targetPort;
+            skyrimPlatform_16.printConsole("Connecting to " + targetIp + ":" + targetPort + " (forced)");
+            networking.connect(targetIp, targetPort);
             SkympClient = /** @class */ (function () {
                 function SkympClient() {
                     var _this = this;
@@ -3862,6 +5097,45 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                     animation_2.setupHooks();
                     updateOwner.setup();
                     sp.printConsole("SkympClient ctor");
+                    // VOA: expose send + id maps for playerInteract (names / radial / trade)
+                    try {
+                        var self = this;
+                        // Host property (NOT storage) — safe to call from browser module
+                        skyrimPlatform_16._voaEmit = function (msg, reliable) {
+                            try {
+                                if (self.sendTarget && typeof self.sendTarget.send === "function") {
+                                    self.sendTarget.send(msg, reliable !== false);
+                                    return true;
+                                }
+                            }
+                            catch (eS) { /* ignore */ }
+                            return false;
+                        };
+                        skyrimPlatform_16.storage._voaSendFn = function (msg, reliable) {
+                            try {
+                                if (self.sendTarget)
+                                    self.sendTarget.send(msg, reliable !== false);
+                            }
+                            catch (eS) { /* ignore */ }
+                        };
+                        skyrimPlatform_16.storage._voaLocalToRemote = function (localId) {
+                            try {
+                                return self.localIdToRemoteId(localId);
+                            }
+                            catch (e) {
+                                return 0;
+                            }
+                        };
+                        skyrimPlatform_16.storage._voaRemoteToLocal = function (remoteId) {
+                            try {
+                                return self.remoteIdToLocalId(remoteId);
+                            }
+                            catch (e) {
+                                return 0;
+                            }
+                        };
+                    }
+                    catch (eMap) { /* ignore */ }
                     networking.on("connectionFailed", function () {
                         skyrimPlatform_16.printConsole("Connection failed");
                     });
@@ -3872,14 +5146,77 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                         _this.msgHandler.handleConnectionAccepted();
                     });
                     networking.on("disconnect", function () {
+                        // Force-save BEFORE teardown ??? covers Alt+F4 after TCP dies, kick, server stop
+                        try {
+                            _this.reportCharacterState(true, "net-disconnect");
+                        }
+                        catch (eDisc) { /* ignore */ }
                         _this.msgHandler.handleDisconnect();
                     });
                     networking.on("message", function (msgAny) {
                         handleMessage(msgAny, _this.msgHandler);
                     });
+                    // Expose force-save for RemoteServer handleDisconnect / other modules
+                    try {
+                        skyrimPlatform_16.storage._voaForceCharSave = function (reason) {
+                            try {
+                                _this.reportCharacterState(true, reason || "force");
+                            }
+                            catch (eF) { /* ignore */ }
+                        };
+                    }
+                    catch (eStor) { /* ignore */ }
+                    // Quit / main menu / pause ??? best chance to persist before forced process kill
+                    skyrimPlatform_16.on("menuOpen", function (e) {
+                        try {
+                            var name = (e && (e.name || e.menuName)) || "";
+                            name = String(name);
+                            // Common exit / leave-world menus
+                            if (name === "Quit Game" ||
+                                name === "Main Menu" ||
+                                name === "Journal Menu" ||
+                                name === "Pause Menu" ||
+                                name === "Loading Menu" ||
+                                name.indexOf("Quit") >= 0) {
+                                _this.reportCharacterState(true, "menu:" + name);
+                            }
+                        }
+                        catch (eMenu) { /* ignore */ }
+                    });
+                    // Inventory/gear changes ??? debounced flush so Alt+F4 soon after loot still keeps items
+                    skyrimPlatform_16.on("containerChanged", function () {
+                        try {
+                            _this._voaInvDirty = true;
+                        }
+                        catch (eInv) { /* ignore */ }
+                    });
+                    skyrimPlatform_16.on("equip", function () {
+                        try {
+                            _this._voaInvDirty = true;
+                        }
+                        catch (eEq) { /* ignore */ }
+                    });
+                    skyrimPlatform_16.on("unequip", function () {
+                        try {
+                            _this._voaInvDirty = true;
+                        }
+                        catch (eUeq) { /* ignore */ }
+                    });
                     skyrimPlatform_16.on("update", function () {
                         if (!_this.singlePlayer) {
                             _this.sendInputs();
+                            // Dirty inventory flush (max once / 8s)
+                            if (_this._voaInvDirty) {
+                                var nowInv = Date.now();
+                                if (!_this._voaLastInvFlush || nowInv - _this._voaLastInvFlush > 8000) {
+                                    _this._voaInvDirty = false;
+                                    _this._voaLastInvFlush = nowInv;
+                                    try {
+                                        _this.reportCharacterState(true, "inv-dirty");
+                                    }
+                                    catch (eFlush) { /* ignore */ }
+                                }
+                            }
                         }
                     });
                     var lastInv;
@@ -3910,8 +5247,23 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                         var openState = e.target.getOpenState();
                         if (openState === 2 /* Opening */ || openState === 4 /* Closing */)
                             return;
-                        _this.sendTarget.send({ t: messages_3.MsgType.Activate, data: { caster: caster, target: target } }, true);
-                        skyrimPlatform_16.printConsole("sendActi", { caster: caster, target: target });
+                        // VOA: full Activate payload (idx added by RemoteServer.send).
+                        // isSecondActivation required by modern MpClientPlugin schemas.
+                        var actiMsg = {
+                            t: messages_3.MsgType.Activate,
+                            data: {
+                                caster: caster,
+                                target: target,
+                                isSecondActivation: false,
+                            },
+                        };
+                        try {
+                            _this.sendTarget.send(actiMsg, true);
+                            skyrimPlatform_16.printConsole("sendActi", actiMsg.data);
+                        }
+                        catch (eActi) {
+                            skyrimPlatform_16.printConsole("sendActi FAILED: " + eActi + " data=" + JSON.stringify(actiMsg.data));
+                        }
                     });
                     var furnitureStreak = new Map();
                     skyrimPlatform_16.on("containerChanged", function (e) {
@@ -4028,7 +5380,7 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                                 }
                             } catch (eIgnore) { /* ignore */ }
                             // Soft handling: stay connected; only log (was: disconnect + SP mode)
-                            skyrimPlatform_16.printConsole("VOA: non-SP loadGame detected — staying in multiplayer");
+                            skyrimPlatform_16.printConsole("VOA: non-SP loadGame detected ??? staying in multiplayer");
                             return;
                         }
                     });
@@ -4056,7 +5408,7 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                         var tgtId = e.target ? e.target.getFormID() : 0;
                         var agrId = e.agressor ? e.agressor.getFormID() : 0;
                         var srcId = e.source ? e.source.getFormID() : 0;
-                        // VOA: we got hit — if HP is critical, enter downed (don't hard-die)
+                        // VOA: we got hit ??? if HP is critical, enter downed (don't hard-die)
                         if (tgtId === playerFormId) {
                             try {
                                 var me = skyrimPlatform_16.Game.getPlayer();
@@ -4102,10 +5454,38 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                             return;
                         if (skyrimPlatform_16.Actor.from(e.target)) {
                             try {
+                                // Native scamp OnHit has no damage on VOA build ??? still send for completeness
                                 _this.sendTarget.send({ t: messages_3.MsgType.OnHit, data: hit_1.getHitData(e) }, true);
-                                skyrimPlatform_16.printConsole("VOA OnHit -> " + tgtId.toString(16));
                             } catch (err) {
                                 skyrimPlatform_16.printConsole("VOA OnHit send failed: " + err);
+                            }
+                            // VOA authoritative PvP: CustomEvent ??? gamemode mp.set(healthPercentage)
+                            try {
+                                var remoteTgt = _this.localIdToRemoteId(tgtId);
+                                if (remoteTgt && (remoteTgt >>> 0) >= 0xff000000) {
+                                    var dmg = 0.22;
+                                    try {
+                                        if (e.isPowerAttack)
+                                            dmg = 0.32;
+                                        else if (e.isBashAttack)
+                                            dmg = 0.14;
+                                        else if (e.isSneakAttack)
+                                            dmg = 0.28;
+                                    }
+                                    catch (eD) { /* ignore */ }
+                                    _this.sendTarget.send({
+                                        t: messages_3.MsgType.CustomEvent,
+                                        eventName: "_voaHit",
+                                        args: [remoteTgt, dmg],
+                                    }, true);
+                                    skyrimPlatform_16.printConsole("VOA hit pvp -> " + remoteTgt.toString(16) + " dmg=" + dmg);
+                                }
+                                else {
+                                    skyrimPlatform_16.printConsole("VOA hit skip (no remote id for local " + tgtId.toString(16) + ")");
+                                }
+                            }
+                            catch (err2) {
+                                skyrimPlatform_16.printConsole("VOA _voaHit send failed: " + err2);
                             }
                         }
                     });
@@ -4189,7 +5569,15 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                         if (anim.animEventName !== "") {
                             this.lastAnimationSent.set(refrIdStr, anim);
                             this.updateActorValuesAfterAnimation(anim.animEventName);
-                            this.sendTarget.send({ t: messages_3.MsgType.UpdateAnimation, data: anim, _refrId: _refrId }, false);
+                            // VOA: combat anims reliable so friends actually see punches/swings
+                            var animName = (anim.animEventName || "").toLowerCase();
+                            var reliableAnim = animName.indexOf("attack") !== -1 ||
+                                animName.indexOf("bash") !== -1 ||
+                                animName.indexOf("hit") !== -1 ||
+                                animName.indexOf("recoil") !== -1 ||
+                                animName.indexOf("stagger") !== -1 ||
+                                animName.indexOf("ragdoll") !== -1;
+                            this.sendTarget.send({ t: messages_3.MsgType.UpdateAnimation, data: anim, _refrId: _refrId }, reliableAnim);
                             if (skyrimPlatform_16.storage._api_onAnimationEvent &&
                                 skyrimPlatform_16.storage._api_onAnimationEvent.callback) {
                                 try {
@@ -4223,7 +5611,7 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                             apiBase = master.replace(/\/$/, "");
                     }
                     catch (e) { /* ignore */ }
-                    // 1) Server log path (status → launcher merge)
+                    // 1) Server log path (status ??? launcher merge)
                     try {
                         this.sendTarget.send({
                             t: messages_3.MsgType.CustomEvent,
@@ -4256,6 +5644,182 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                         }
                     }
                     skyrimPlatform_16.printConsole("VOA character name p" + profileId + " slot " + slot + " => " + name);
+                };
+                /**
+                 * VOA character DB: push name, pos, equipment, inventory, discovered map markers
+                 * to the platform API (and game-server custom event for gamemode mirror).
+                 */
+                SkympClient.prototype.reportCharacterState = function (force, reason) {
+                    var now = Date.now();
+                    // Normal cadence ~20s; force (disconnect / quit / inv) always sends
+                    if (!force && this._voaLastStateReport && now - this._voaLastStateReport < 20000)
+                        return;
+                    // Even forced saves: de-dupe within 1.5s so menu spam doesn't flood API
+                    if (force && this._voaLastForceReport && now - this._voaLastForceReport < 1500)
+                        return;
+                    this._voaLastStateReport = now;
+                    if (force)
+                        this._voaLastForceReport = now;
+                    reason = reason || (force ? "force" : "interval");
+                    var slot = 0;
+                    var profileId = 0;
+                    var session = "";
+                    var apiBase = "http://127.0.0.1:3100";
+                    try {
+                        var gd = skyrimPlatform_16.settings["skymp5-client"]["gameData"] || {};
+                        if (typeof gd.characterSlot === "number")
+                            slot = gd.characterSlot;
+                        if (typeof gd.profileId === "number")
+                            profileId = gd.profileId;
+                        if (typeof gd.session === "string")
+                            session = gd.session;
+                        var master = skyrimPlatform_16.settings["skymp5-client"]["master"];
+                        if (typeof master === "string" && master.length) {
+                            // Prefer public master URL so state hits the real API, not only 127.0.0.1
+                            apiBase = master.replace(/\/$/, "");
+                        }
+                    }
+                    catch (e0) { /* ignore */ }
+                    var player = skyrimPlatform_16.Game.getPlayer();
+                    if (!player)
+                        return;
+                    var name = "";
+                    var appearance = null;
+                    var equipment = null;
+                    var inventory = null;
+                    var pos = null;
+                    var angleZ = 0;
+                    var worldOrCell = 0;
+                    try {
+                        var look = look_3.getLook(player);
+                        if (look) {
+                            appearance = look;
+                            if (look.name)
+                                name = look.name;
+                        }
+                    }
+                    catch (eL) { /* ignore */ }
+                    try {
+                        equipment = equipment_3.getEquipment(player, this.numEquipmentChanges || 0);
+                    }
+                    catch (eE) { /* ignore */ }
+                    try {
+                        inventory = inventory_4.getInventory(player);
+                    }
+                    catch (eI) { /* ignore */ }
+                    try {
+                        pos = [
+                            player.getPositionX(),
+                            player.getPositionY(),
+                            player.getPositionZ(),
+                        ];
+                        angleZ = player.getAngleZ();
+                    }
+                    catch (eP) { /* ignore */ }
+                    try {
+                        var cell = player.getParentCell();
+                        var world = player.getWorldSpace();
+                        if (cell)
+                            worldOrCell = cell.getFormID();
+                        else if (world)
+                            worldOrCell = world.getFormID();
+                    }
+                    catch (eW) { /* ignore */ }
+                    // Discovered map markers near the player (ObjectReference.isMapMarkerVisible)
+                    var mapMarkers = [];
+                    try {
+                        var prev = skyrimPlatform_16.storage["voaMapMarkers"];
+                        if (Array.isArray(prev))
+                            mapMarkers = prev.slice();
+                    }
+                    catch (eM0) { /* ignore */ }
+                    try {
+                        // Sample nearby refs of type Statue/Activator/etc is expensive; scan last crosshair + known set
+                        var known = skyrimPlatform_16.storage["voaMapMarkers"] || [];
+                        if (!Array.isArray(known))
+                            known = [];
+                        // When map menu is open, mark current cell as discovered location
+                        if (skyrimPlatform_16.Ui.isMenuOpen("MapMenu") && worldOrCell) {
+                            var found = false;
+                            for (var mi = 0; mi < known.length; mi++) {
+                                if (known[mi] && known[mi].formId === worldOrCell)
+                                    found = true;
+                            }
+                            if (!found) {
+                                known.push({
+                                    formId: worldOrCell,
+                                    name: name || "Location",
+                                    x: pos ? pos[0] : 0,
+                                    y: pos ? pos[1] : 0,
+                                    z: pos ? pos[2] : 0,
+                                    at: now,
+                                });
+                            }
+                        }
+                        // Cap list
+                        if (known.length > 200)
+                            known = known.slice(known.length - 200);
+                        skyrimPlatform_16.storage["voaMapMarkers"] = known;
+                        mapMarkers = known;
+                    }
+                    catch (eM1) { /* ignore */ }
+                    var state = {
+                        name: name,
+                        worldOrCell: worldOrCell,
+                        pos: pos,
+                        angleZ: angleZ,
+                        equipment: equipment,
+                        inventory: inventory,
+                        appearance: appearance,
+                        mapMarkers: mapMarkers,
+                    };
+                    // Always try game-server custom event first (gamemode saves even if API URL wrong)
+                    try {
+                        if (this.sendTarget && typeof this.sendTarget.send === "function") {
+                            this.sendTarget.send({
+                                t: messages_3.MsgType.CustomEvent,
+                                eventName: "_voaCharacterState",
+                                args: [profileId, slot, JSON.stringify(state)],
+                            }, true);
+                        }
+                    }
+                    catch (eC) { /* ignore */ }
+                    // Direct API write ??? works after net drop if session still valid briefly
+                    if (session) {
+                        try {
+                            var client = new skyrimPlatform_16.HttpClient(apiBase);
+                            var body = JSON.stringify({
+                                session: session,
+                                profileId: profileId,
+                                slot: slot,
+                                name: name || undefined,
+                                worldOrCell: worldOrCell || undefined,
+                                pos: pos || undefined,
+                                angleZ: angleZ,
+                                equipment: equipment,
+                                inventory: inventory,
+                                appearance: appearance,
+                                mapMarkers: mapMarkers,
+                                reason: reason,
+                            });
+                            client.post("/v1/game/character-state", {
+                                body: body,
+                                contentType: "application/json",
+                            }).then(function (res) {
+                                if (force) {
+                                    skyrimPlatform_16.printConsole("VOA state flush reason=" + reason + " status=" + (res && res.status));
+                                }
+                                else if (res && res.status >= 400) {
+                                    skyrimPlatform_16.printConsole("VOA state API status=" + res.status);
+                                }
+                            }).catch(function (err) {
+                                if (force) {
+                                    skyrimPlatform_16.printConsole("VOA state flush failed reason=" + reason + " err=" + err);
+                                }
+                            });
+                        }
+                        catch (eHttp) { /* ignore */ }
+                    }
                 };
                 SkympClient.prototype.sendLook = function (_refrId) {
                     if (_refrId)
@@ -4390,6 +5954,11 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                         _this.sendActorValuePercentage(target);
                     });
                     this.sendHostAttempts();
+                    // VOA character DB snapshot (throttled ~20s inside)
+                    try {
+                        _this.reportCharacterState(false, "interval");
+                    }
+                    catch (eState) { /* ignore */ }
                 };
                 SkympClient.prototype.resetRemoteServer = function () {
                     var prevRemoteServer = skyrimPlatform_16.storage.remoteServer;
@@ -4473,15 +6042,750 @@ System.register("skymp5-client/src/front/version", ["build/dist/client/Data/Plat
             exports_36("verifyVersion", verifyVersion = function () {
                 var ok = typeof realVersion === "string" && (realVersion.indexOf("2.9") === 0 || realVersion.indexOf("2.8") === 0 || requiredVersion === realVersion);
                 if (!ok) {
-                    skyrimPlatform_17.printConsole("VOA: SkyrimPlatform version " + realVersion + " (expected 2.9.x) — continuing anyway");
+                    skyrimPlatform_17.printConsole("VOA: SkyrimPlatform version " + realVersion + " (expected 2.9.x) ??? continuing anyway");
                 }
             });
         }
     };
 });
-System.register("skymp5-client/src/front/index", ["skymp5-client/src/front/skympClient", "skymp5-client/src/front/browser", "skymp5-client/src/front/loadGameManager", "build/dist/client/Data/Platform/Modules/skyrimPlatform", "skymp5-client/src/front/version", "skymp5-client/src/front/worldCleaner"], function (exports_37, context_37) {
+/* VOA: overhead names + hold-E radial (give name / trade) ??? injected into skymp5-client */
+System.register("skymp5-client/src/front/playerInteract", ["build/dist/client/Data/Platform/Modules/skyrimPlatform", "skymp5-client/src/front/messages", "skymp5-client/src/front/components/inventory"], function (exports_pi, context_pi) {
     "use strict";
-    var skympClient_1, browser, loadGameManager, skyrimPlatform_18, version_1, worldCleaner_2, enforceLimitations, lastTimeUpd, riftenUnlocked, n, k, zeroKMoment, lastFps;
+    var sp, messages_pi, inventory_pi, setupPlayerInteract;
+    var __moduleName = context_pi && context_pi.id;
+    return {
+        setters: [
+            function (sp_1) { sp = sp_1; },
+            function (m) { messages_pi = m; },
+            function (inv) { inventory_pi = inv; }
+        ],
+        execute: function () {
+            /**
+             * Overhead nameplates (hidden until revealed), hold-E radial on other players,
+             * give-name / nearby intro, and 2-player trade UI.
+             */
+            exports_pi("setupPlayerInteract", setupPlayerInteract = function (getSend, localIdToRemoteId, remoteIdToLocalId) {
+                try {
+                    if (sp.storage["voaPlayerInteractReady"])
+                        return;
+                    sp.storage["voaPlayerInteractReady"] = true;
+                }
+                catch (e0) { return; }
+
+                var HOLD_MS = 450;
+                var NAME_RANGE = 1800;
+                var eHeldSince = 0;
+                var menuOpen = false;
+                var tradeOpen = false;
+                var focusRemoteId = 0;
+                var nameTexts = {}; // remoteId -> textId
+                var lastPlateAt = 0;
+
+                // --- helpers ---
+                var sendInteract = function (action, targetRemoteId, payload) {
+                    try {
+                        var send = getSend && getSend();
+                        if (!send) {
+                            sp.printConsole("VOA interact: no send yet");
+                            return;
+                        }
+                        send({
+                            t: messages_pi.MsgType.CustomEvent,
+                            eventName: "_voaInteract",
+                            args: [
+                                action,
+                                Number(targetRemoteId) || 0,
+                                JSON.stringify(payload || {}),
+                            ],
+                        }, true);
+                        sp.printConsole("VOA interact send " + action + " -> " + (targetRemoteId || 0).toString(16));
+                    }
+                    catch (eS) {
+                        sp.printConsole("VOA interact send err " + eS);
+                    }
+                };
+
+                var myRemoteId = function () {
+                    try {
+                        // owner form from world model isn't easy; use 0 and let server use sender
+                        return 0;
+                    }
+                    catch (e) { return 0; }
+                };
+
+                var getTrueName = function (remoteId) {
+                    try {
+                        var map = sp.storage["voaTrueNames"] || {};
+                        if (map[remoteId]) return String(map[remoteId]);
+                    }
+                    catch (e) {}
+                    return "";
+                };
+
+                var getDisplayName = function (remoteId) {
+                    try {
+                        var rev = sp.storage["voaRevealedNames"] || {};
+                        if (rev[remoteId]) return String(rev[remoteId]);
+                    }
+                    catch (e) {}
+                    return "???";
+                };
+
+                var rememberTrueName = function (remoteId, name) {
+                    if (!remoteId || !name) return;
+                    try {
+                        var map = sp.storage["voaTrueNames"];
+                        if (!map || typeof map !== "object") {
+                            map = {};
+                            sp.storage["voaTrueNames"] = map;
+                        }
+                        map[remoteId] = String(name);
+                    }
+                    catch (e) {}
+                };
+
+                // --- CEF UI builders ---
+                var ensureBrowser = function () {
+                    try {
+                        sp.browser.setVisible(true);
+                    }
+                    catch (e) {}
+                };
+
+                var injectCssOnce = function () {
+                    if (sp.storage["voaUiCss"]) return;
+                    sp.storage["voaUiCss"] = true;
+                    ensureBrowser();
+                    var css = "(function(){try{if(document.getElementById('voa-ui-style'))return;" +
+                        "var s=document.createElement('style');s.id='voa-ui-style';s.textContent=" +
+                        JSON.stringify(
+                            "#voa-radial,#voa-trade,#voa-trade-req{font-family:Segoe UI,Tahoma,sans-serif;color:#e8e6e3}" +
+                            "#voa-radial{position:fixed;inset:0;z-index:2147483646;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45)}" +
+                            "#voa-radial .ring{position:relative;width:280px;height:280px}" +
+                            "#voa-radial .btn{position:absolute;width:110px;height:110px;border-radius:50%;border:2px solid rgba(201,162,39,.85);" +
+                            "background:radial-gradient(circle at 30% 25%,#2a3344,#12161e);color:#f0e6c8;font-weight:700;font-size:12px;letter-spacing:.04em;" +
+                            "text-transform:uppercase;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.55);padding:10px;line-height:1.25}" +
+                            "#voa-radial .btn:hover{border-color:#e0c04a;transform:scale(1.05)}" +
+                            "#voa-radial .c{left:50%;top:50%;transform:translate(-50%,-50%);width:72px;height:72px;font-size:11px;opacity:.9}" +
+                            "#voa-radial .b0{left:50%;top:8px;transform:translateX(-50%)}" +
+                            "#voa-radial .b1{right:8px;top:50%;transform:translateY(-50%)}" +
+                            "#voa-radial .b2{left:8px;top:50%;transform:translateY(-50%)}" +
+                            "#voa-trade{position:fixed;inset:0;z-index:2147483646;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55)}" +
+                            "#voa-trade .panel{width:min(920px,94vw);max-height:86vh;overflow:auto;background:linear-gradient(180deg,#1a1f2a,#0e1218);" +
+                            "border:2px solid rgba(201,162,39,.75);border-radius:14px;padding:16px 18px;box-shadow:0 16px 48px rgba(0,0,0,.7)}" +
+                            "#voa-trade h2{margin:0 0 10px;font-size:14px;letter-spacing:.12em;text-transform:uppercase;color:#c9a227}" +
+                            "#voa-trade .cols{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}" +
+                            "#voa-trade .col{background:rgba(255,255,255,.04);border-radius:10px;padding:10px;min-height:200px}" +
+                            "#voa-trade .item{display:flex;justify-content:space-between;gap:8px;padding:6px 8px;margin:4px 0;border-radius:6px;background:rgba(0,0,0,.25);cursor:pointer;font-size:13px}" +
+                            "#voa-trade .item:hover{background:rgba(201,162,39,.15)}" +
+                            "#voa-trade .actions{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}" +
+                            "#voa-trade button,#voa-trade-req button{cursor:pointer;border:none;border-radius:8px;padding:10px 14px;font-weight:700;font-size:13px;" +
+                            "background:linear-gradient(180deg,#e0c04a,#a8841c);color:#1a1408}" +
+                            "#voa-trade button.secondary{background:#2a3344;color:#e8e6e3;border:1px solid rgba(255,255,255,.15)}" +
+                            "#voa-trade-req{position:fixed;left:50%;bottom:14%;transform:translateX(-50%);z-index:2147483646;background:rgba(8,10,14,.92);" +
+                            "border:2px solid rgba(201,162,39,.75);border-radius:12px;padding:14px 18px;min-width:280px;text-align:center}"
+                        ) +
+                        ";document.head.appendChild(s);}catch(e){}})();";
+                    try { sp.browser.executeJavaScript(css); } catch (e) {}
+                };
+
+                var closeRadial = function () {
+                    menuOpen = false;
+                    try {
+                        sp.browser.executeJavaScript("(function(){var e=document.getElementById('voa-radial');if(e)e.remove();try{window.skyrimPlatform&&window.skyrimPlatform.sendMessage(['voaRadialClose']);}catch(x){}})();");
+                    } catch (e) {}
+                    try { sp.browser.setFocused(false); } catch (e2) {}
+                };
+
+                var openRadial = function (remoteId, label) {
+                    injectCssOnce();
+                    ensureBrowser();
+                    menuOpen = true;
+                    focusRemoteId = remoteId;
+                    var title = label || "Player";
+                    var js = "(function(){try{if(!document.body)return;" +
+                        "var old=document.getElementById('voa-radial');if(old)old.remove();" +
+                        "var el=document.createElement('div');el.id='voa-radial';" +
+                        "el.innerHTML='<div class=\"ring\">" +
+                        "<button class=\"btn b0\" data-a=\"givename\">Give Name<br/>to Player</button>" +
+                        "<button class=\"btn b1\" data-a=\"givename_nearby\">Give Name<br/>Nearby</button>" +
+                        "<button class=\"btn b2\" data-a=\"trade_request\">Trade</button>" +
+                        "<button class=\"btn c\" data-a=\"close\">Close</button>" +
+                        "</div><div style=\"position:absolute;bottom:18%;left:50%;transform:translateX(-50%);opacity:.85;font-size:13px\">" +
+                        title.replace(/'/g, "") + " ??? hold menu</div>';" +
+                        "document.body.appendChild(el);" +
+                        "el.querySelectorAll('button').forEach(function(b){b.onclick=function(){" +
+                        "var a=b.getAttribute('data-a');" +
+                        "try{window.skyrimPlatform.sendMessage(['voaRadial',a," + remoteId + "]);}catch(e1){" +
+                        "try{window.skyrimPlatform.sendMessage('voaRadial',a," + remoteId + ");}catch(e2){}}" +
+                        "};});" +
+                        "el.addEventListener('click',function(ev){if(ev.target===el){try{window.skyrimPlatform.sendMessage(['voaRadial','close',0]);}catch(e){}}});" +
+                        "}catch(e0){}})();";
+                    try {
+                        sp.browser.executeJavaScript(js);
+                        sp.browser.setFocused(true);
+                    } catch (e) {
+                        sp.printConsole("VOA radial open fail " + e);
+                    }
+                    sp.printConsole("VOA: radial open target=" + remoteId.toString(16));
+                };
+
+                var hideTrade = function () {
+                    tradeOpen = false;
+                    try {
+                        sp.browser.executeJavaScript("(function(){var e=document.getElementById('voa-trade');if(e)e.remove();})();");
+                    } catch (e) {}
+                    try { sp.browser.setFocused(false); } catch (e2) {}
+                };
+
+                var showTrade = function (ui) {
+                    if (!ui) return;
+                    injectCssOnce();
+                    ensureBrowser();
+                    tradeOpen = true;
+                    sp.storage["voaTradeState"] = ui;
+                    // Build inventory list from local player
+                    var invItems = [];
+                    try {
+                        var inv = inventory_pi.getInventory(sp.Game.getPlayer());
+                        if (inv && inv.entries) {
+                            for (var i = 0; i < inv.entries.length; i++) {
+                                var e = inv.entries[i];
+                                if (!e || e.worn) continue;
+                                var bid = Number(e.baseId) || 0;
+                                var cnt = Number(e.count) || 0;
+                                if (!bid || !cnt) continue;
+                                var nm = e.name || ("#" + bid.toString(16));
+                                invItems.push({ baseId: bid, count: cnt, name: String(nm) });
+                            }
+                        }
+                    } catch (eI) {}
+                    var myOffer = ui.myOffer || [];
+                    var theirOffer = ui.theirOffer || [];
+                    var payload = {
+                        tradeId: ui.tradeId,
+                        partnerName: ui.partnerName || "Player",
+                        readyMe: !!ui.readyMe,
+                        readyThem: !!ui.readyThem,
+                        inv: invItems.slice(0, 40),
+                        myOffer: myOffer,
+                        theirOffer: theirOffer,
+                    };
+                    var js = "(function(){try{if(!document.body)return;" +
+                        "var d=" + JSON.stringify(payload) + ";" +
+                        "var old=document.getElementById('voa-trade');if(old)old.remove();" +
+                        "var el=document.createElement('div');el.id='voa-trade';" +
+                        "function esc(t){return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;');}" +
+                        "function list(arr,cls,clickable){return (arr||[]).map(function(it,idx){" +
+                        "return '<div class=\"item\" data-cls=\"'+cls+'\" data-i=\"'+idx+'\" data-b=\"'+it.baseId+'\" data-c=\"'+it.count+'\" data-n=\"'+esc(it.name||'')+'\">'+esc(it.name||('#'+it.baseId))+' <span>x'+it.count+'</span></div>';}).join('');}" +
+                        "el.innerHTML='<div class=\"panel\"><h2>Trade with '+esc(d.partnerName)+'</h2>" +
+                        "<div class=\"cols\">" +
+                        "<div class=\"col\"><div style=\"opacity:.7;margin-bottom:6px\">Your inventory</div><div id=\"voa-inv\">'+list(d.inv,'inv',true)+'</div></div>" +
+                        "<div class=\"col\"><div style=\"opacity:.7;margin-bottom:6px\">Your offer</div><div id=\"voa-my\">'+list(d.myOffer,'my',true)+'</div></div>" +
+                        "<div class=\"col\"><div style=\"opacity:.7;margin-bottom:6px\">Their offer</div><div id=\"voa-their\">'+list(d.theirOffer,'their',false)+'</div></div>" +
+                        "</div>" +
+                        "<div style=\"margin-top:10px;font-size:13px\">You: '+(d.readyMe?'READY':'???')+' &nbsp;|&nbsp; Them: '+(d.readyThem?'READY':'???')+'</div>" +
+                        "<div class=\"actions\">" +
+                        "<button id=\"voa-ready\">'+(d.readyMe?'Unready':'Ready')+'</button>" +
+                        "<button class=\"secondary\" id=\"voa-cancel\">Cancel</button>" +
+                        "</div><div style=\"margin-top:8px;opacity:.65;font-size:12px\">Click inventory items to add to offer ?? click offer to remove</div></div>';" +
+                        "document.body.appendChild(el);" +
+                        "var myOffer=JSON.parse(JSON.stringify(d.myOffer||[]));" +
+                        "function syncOffer(){try{window.skyrimPlatform.sendMessage(['voaTrade','offer',d.tradeId,JSON.stringify(myOffer)]);}catch(e){}}" +
+                        "el.querySelectorAll('.item').forEach(function(node){node.onclick=function(){" +
+                        "var cls=node.getAttribute('data-cls');var b=+node.getAttribute('data-b');var c=+node.getAttribute('data-c');var n=node.getAttribute('data-n')||'';" +
+                        "if(cls==='inv'){var found=null;for(var i=0;i<myOffer.length;i++){if(myOffer[i].baseId===b){found=myOffer[i];break;}}" +
+                        "if(found){if(found.count<c)found.count++;}else myOffer.push({baseId:b,count:1,name:n});syncOffer();}" +
+                        "if(cls==='my'){myOffer=myOffer.filter(function(x){return x.baseId!==b;});syncOffer();}" +
+                        "};});" +
+                        "document.getElementById('voa-ready').onclick=function(){try{window.skyrimPlatform.sendMessage(['voaTrade','ready',d.tradeId,d.readyMe?0:1]);}catch(e){}};" +
+                        "document.getElementById('voa-cancel').onclick=function(){try{window.skyrimPlatform.sendMessage(['voaTrade','cancel',d.tradeId]);}catch(e){}};" +
+                        "}catch(e0){}})();";
+                    try {
+                        sp.browser.executeJavaScript(js);
+                        sp.browser.setFocused(true);
+                    } catch (eT) {
+                        sp.printConsole("VOA trade UI fail " + eT);
+                    }
+                };
+
+                var showTradeRequest = function (req) {
+                    injectCssOnce();
+                    ensureBrowser();
+                    var js = "(function(){try{if(!document.body)return;" +
+                        "var old=document.getElementById('voa-trade-req');if(old)old.remove();" +
+                        "var el=document.createElement('div');el.id='voa-trade-req';" +
+                        "el.innerHTML='<div style=\"font-size:12px;letter-spacing:.1em;text-transform:uppercase;color:#c9a227;margin-bottom:6px\">Trade request</div>" +
+                        "<div style=\"margin-bottom:12px\">'+(" + JSON.stringify(String(req.fromName || "Player")) + ")+' wants to trade</div>" +
+                        "<button id=\"voa-tr-yes\">Accept</button> <button id=\"voa-tr-no\" style=\"margin-left:8px;background:#333;color:#eee;border:1px solid #666;border-radius:8px;padding:10px 14px\">Decline</button>';" +
+                        "document.body.appendChild(el);" +
+                        "document.getElementById('voa-tr-yes').onclick=function(){try{window.skyrimPlatform.sendMessage(['voaTrade','accept'," + Number(req.id) + "]);}catch(e){};el.remove();};" +
+                        "document.getElementById('voa-tr-no').onclick=function(){try{window.skyrimPlatform.sendMessage(['voaTrade','decline'," + Number(req.id) + "]);}catch(e){};el.remove();};" +
+                        "}catch(e0){}})();";
+                    try {
+                        sp.browser.executeJavaScript(js);
+                        sp.browser.setFocused(true);
+                    } catch (e) {}
+                };
+
+                // Expose for server-driven eval updates
+                try {
+                    sp.storage._voaShowTrade = showTrade;
+                    sp.storage._voaHideTrade = hideTrade;
+                    sp.storage._voaShowTradeRequest = showTradeRequest;
+                } catch (eX) {}
+
+                // browserMessage from CEF
+                try {
+                    sp.on("browserMessage", function (e) {
+                        try {
+                            var args = (e && e.arguments) ? e.arguments : e;
+                            if (!args) return;
+                            // flatten nested
+                            var a0 = args[0];
+                            if (a0 && a0.length && typeof a0 !== "string") {
+                                args = a0;
+                                a0 = args[0];
+                            }
+                            if (a0 === "voaRadial" || a0 === "voaRadialClose") {
+                                if (a0 === "voaRadialClose" || args[1] === "close") {
+                                    closeRadial();
+                                    return;
+                                }
+                                var action = String(args[1] || "");
+                                var tid = Number(args[2]) || focusRemoteId;
+                                closeRadial();
+                                if (action === "givename")
+                                    sendInteract("giveName", tid, {});
+                                else if (action === "givename_nearby")
+                                    sendInteract("giveName_nearby", 0, {});
+                                else if (action === "trade_request")
+                                    sendInteract("trade_request", tid, {});
+                                return;
+                            }
+                            if (a0 === "voaTrade") {
+                                var op = String(args[1] || "");
+                                var tradeId = Number(args[2]) || 0;
+                                if (op === "accept")
+                                    sendInteract("trade_accept", 0, { tradeId: tradeId });
+                                else if (op === "decline")
+                                    sendInteract("trade_decline", 0, { tradeId: tradeId });
+                                else if (op === "cancel") {
+                                    hideTrade();
+                                    sendInteract("trade_cancel", 0, { tradeId: tradeId });
+                                }
+                                else if (op === "ready") {
+                                    var ready = Number(args[3]) === 1;
+                                    sendInteract("trade_ready", 0, { tradeId: tradeId, ready: ready });
+                                }
+                                else if (op === "offer") {
+                                    var offer = [];
+                                    try { offer = JSON.parse(String(args[3] || "[]")); } catch (eJ) { offer = []; }
+                                    sendInteract("trade_offer", 0, { tradeId: tradeId, offer: offer });
+                                }
+                            }
+                        }
+                        catch (err) {
+                            sp.printConsole("VOA browserMessage " + err);
+                        }
+                    });
+                }
+                catch (eBm) {}
+
+                // Hook createActor/look storage: remember true names from model updates via world view
+                // We scan storage each frame for form views via crosshair + nearby actors with 0xff ids
+
+                var destroyPlate = function (rid) {
+                    try {
+                        if (nameTexts[rid] != null) {
+                            sp.destroyText(nameTexts[rid]);
+                            delete nameTexts[rid];
+                        }
+                    } catch (e) {}
+                };
+
+                var updateNameplates = function () {
+                    var now = Date.now();
+                    if (now - lastPlateAt < 50) return; // ~20fps plates
+                    lastPlateAt = now;
+                    if (menuOpen || tradeOpen) return;
+                    try {
+                        if (sp.Ui.isMenuOpen("Loading Menu") || sp.Ui.isMenuOpen("MapMenu") || sp.Ui.isMenuOpen("InventoryMenu"))
+                            return;
+                    } catch (eM) {}
+
+                    var player = sp.Game.getPlayer();
+                    if (!player) return;
+                    var seen = {};
+                    var px = player.getPositionX();
+                    var py = player.getPositionY();
+                    var pz = player.getPositionZ();
+
+                    // Collect nearby MP players via form views remote ids stored when we see looks
+                    var trueNames = sp.storage["voaTrueNames"] || {};
+                    var keys = Object.keys(trueNames);
+                    for (var ki = 0; ki < keys.length; ki++) {
+                        var rid = Number(keys[ki]);
+                        if (!rid || rid < 0xff000000) continue;
+                        var localId = 0;
+                        try {
+                            localId = remoteIdToLocalId ? remoteIdToLocalId(rid) : 0;
+                        } catch (eR) { localId = 0; }
+                        if (!localId) continue;
+                        var ac = sp.Actor.from(sp.Game.getFormEx(localId));
+                        if (!ac || ac.isDisabled()) {
+                            destroyPlate(rid);
+                            continue;
+                        }
+                        var dx = ac.getPositionX() - px;
+                        var dy = ac.getPositionY() - py;
+                        var dz = ac.getPositionZ() - pz;
+                        var dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                        if (dist > NAME_RANGE) {
+                            destroyPlate(rid);
+                            continue;
+                        }
+                        var headPos = [
+                            sp.NetImmerse.getNodeWorldPositionX(ac, "NPC Head [Head]", false),
+                            sp.NetImmerse.getNodeWorldPositionY(ac, "NPC Head [Head]", false),
+                            sp.NetImmerse.getNodeWorldPositionZ(ac, "NPC Head [Head]", false) + 12,
+                        ];
+                        if (!headPos[0] && !headPos[1] && !headPos[2]) {
+                            headPos = [ac.getPositionX(), ac.getPositionY(), ac.getPositionZ() + 100];
+                        }
+                        var scr = sp.worldPointToScreenPoint(headPos)[0];
+                        if (!scr || scr[2] <= 0 || scr[0] < 0 || scr[0] > 1 || scr[1] < 0 || scr[1] > 1) {
+                            destroyPlate(rid);
+                            continue;
+                        }
+                        var label = getDisplayName(rid);
+                        // SP createText = screen PIXELS (SpriteBatch). worldPointToScreenPoint is 0..1.
+                        var sw = 1920, sh = 1080;
+                        try {
+                            if (sp.storage["voaScreenW"]) sw = Number(sp.storage["voaScreenW"]) || sw;
+                            if (sp.storage["voaScreenH"]) sh = Number(sp.storage["voaScreenH"]) || sh;
+                        } catch (eRes) {}
+                        var x = scr[0] * sw;
+                        var y = (1 - scr[1]) * sh;
+                        if (nameTexts[rid] == null) {
+                            try {
+                                nameTexts[rid] = sp.createText(x, y, label, [1, 0.9, 0.55, 1], "Tavern");
+                                try { sp.setTextSize(nameTexts[rid], 1.0); } catch (eSz) {}
+                            } catch (eC) {
+                                nameTexts[rid] = null;
+                            }
+                        }
+                        else {
+                            try {
+                                sp.setTextPos(nameTexts[rid], x, y);
+                                sp.setTextString(nameTexts[rid], label);
+                            } catch (eU) {
+                                destroyPlate(rid);
+                            }
+                        }
+                        seen[rid] = true;
+                    }
+                    // cleanup
+                    for (var rid2 in nameTexts) {
+                        if (!seen[rid2]) destroyPlate(Number(rid2));
+                    }
+                };
+
+                // Hold E on player under crosshair
+                sp.on("update", function () {
+                    try {
+                        // Poll trade UI updates from storage (set by eval)
+                        if (sp.storage["voaTradeUi"] && !tradeOpen) {
+                            showTrade(sp.storage["voaTradeUi"]);
+                            sp.storage["voaTradeUi"] = null;
+                        }
+                        if (sp.storage["voaTradeRequest"]) {
+                            showTradeRequest(sp.storage["voaTradeRequest"]);
+                            sp.storage["voaTradeRequest"] = null;
+                        }
+
+                        updateNameplates();
+
+                        if (menuOpen || tradeOpen) {
+                            eHeldSince = 0;
+                            return;
+                        }
+                        // Don't fight activation while menus open
+                        try {
+                            if (sp.Ui.isMenuOpen("Console") || sp.Ui.isMenuOpen("InventoryMenu") || sp.Ui.isMenuOpen("MapMenu"))
+                            {
+                                eHeldSince = 0;
+                                return;
+                            }
+                        } catch (eUi) {}
+
+                        var eDown = false;
+                        try { eDown = sp.Input.isKeyPressed(18 /* E */); } catch (eK) {}
+                        if (!eDown) {
+                            eHeldSince = 0;
+                            return;
+                        }
+                        var cross = sp.Game.getCurrentCrosshairRef();
+                        if (!cross) {
+                            eHeldSince = 0;
+                            return;
+                        }
+                        var localId = cross.getFormID();
+                        if (!localId || localId === 0x14) {
+                            eHeldSince = 0;
+                            return;
+                        }
+                        // Must be an actor (other player clone)
+                        var ac = sp.Actor.from(cross);
+                        if (!ac) {
+                            eHeldSince = 0;
+                            return;
+                        }
+                        var remoteId = 0;
+                        try {
+                            remoteId = localIdToRemoteId ? localIdToRemoteId(localId) : 0;
+                        } catch (eL) { remoteId = 0; }
+                        // Only MP players (0xff*)
+                        if (!remoteId || remoteId < 0xff000000) {
+                            eHeldSince = 0;
+                            return;
+                        }
+                        if (!eHeldSince) eHeldSince = Date.now();
+                        if (Date.now() - eHeldSince >= HOLD_MS) {
+                            eHeldSince = Date.now() + 100000; // prevent re-fire until release
+                            var label = getDisplayName(remoteId);
+                            if (label === "???") label = "Unknown traveler";
+                            openRadial(remoteId, label);
+                        }
+                    }
+                    catch (eAll) {
+                        // silent
+                    }
+                });
+
+                // Store true names when FormView models update ??? hook via periodic scan of createActor looks is hard;
+                // instead patch storage from look when remoteServer createActor runs ??? we monkey via storage callback
+                try {
+                    var prev = sp.storage._voaOnPlayerLook;
+                    sp.storage._voaOnPlayerLook = function (remoteId, name) {
+                        rememberTrueName(remoteId, name);
+                        if (typeof prev === "function") try { prev(remoteId, name); } catch (e) {}
+                    };
+                } catch (eH) {}
+
+                sp.printConsole("VOA: player interact ready (hold E on player ?? nameplates ?? trade)");
+            });
+        }
+    };
+});
+/* VOA CEF chat HUD - always visible log, T focuses input, idle fade 25% after 5s */
+/* VOA chat: Red-House front UI + Keizaal Enter/T focus + _voaChat gamemode bridge */
+System.register("skymp5-client/src/front/voaChat", ["build/dist/client/Data/Platform/Modules/skyrimPlatform", "skymp5-client/src/front/messages", "skymp5-client/src/front/networking"], function (exports_ch, context_ch) {
+    "use strict";
+    var sp, messages_ch, networking_ch, setupVoaChat;
+    var __moduleName = context_ch && context_ch.id;
+    return {
+        setters: [
+            function (sp_1) { sp = sp_1; },
+            function (m) { messages_ch = m; },
+            function (n) { networking_ch = n; }
+        ],
+        execute: function () {
+            exports_ch("setupVoaChat", setupVoaChat = function (getSend, remoteIdToLocalId) {
+                // Browser module now owns CEF chat drain/UI/send. Keep this for legacy hooks only.
+                try {
+                    sp.storage["voaChatReady"] = true;
+                    sp.storage["voaChatReadyAt"] = Date.now();
+                    sp.storage["voaChatRhV5"] = true;
+                } catch (e0) {}
+                try { sp.printConsole("VOA chat: setup OK v5 (browser-owned drain)"); } catch (e1) {}
+                return;
+
+                // Network send via networking module — never call functions stored on sp.storage
+                var sendChat = function (action, a1, a2) {
+                    try {
+                        var args = [action];
+                        if (a1 !== undefined) args.push(a1);
+                        if (a2 !== undefined) args.push(a2);
+                        var msg = { t: messages_ch.MsgType.CustomEvent, eventName: "_voaChat", args: args };
+                        if (networking_ch && typeof networking_ch.send === "function") {
+                            networking_ch.send(msg, true);
+                            return true;
+                        }
+                        // Fallback: try getSend closure (may be storage-backed — last resort)
+                        var send = getSend && getSend();
+                        if (send) {
+                            send(msg, true);
+                            return true;
+                        }
+                        sp.printConsole("VOA chat: no send yet");
+                        return false;
+                    } catch (e) {
+                        sp.printConsole("VOA chat send err " + e);
+                        return false;
+                    }
+                };
+
+                // Queue UI lines as plain JSON for browser module to dispatch via proven CHAT_SHOW path.
+                // (executeJavaScript-from-voaChat alone was unreliable after loadUrl / unfocus.)
+                var lastUiPush = { key: "", at: 0 };
+                var pushFrontMessage = function (line) {
+                    if (!line) return;
+                    var name = String(line.name || "");
+                    var text = String(line.text || "");
+                    var ch = line.channel || "l";
+                    var dedupeKey = ch + "\0" + text;
+                    var now = Date.now();
+                    if (dedupeKey === lastUiPush.key && now - lastUiPush.at < 1500)
+                        return;
+                    lastUiPush.key = dedupeKey;
+                    lastUiPush.at = now;
+                    var color = ch === "g" ? "efc94a" : (ch === "sys" ? "8ec8ff" : "f0ebe3");
+                    var prefix = ch === "g" ? "[G] " : (ch === "sys" ? "[!] " : "[L] ");
+                    // RH getMessageText expects #{RRGGBB} tags
+                    var msg = "#{efc94a}" + prefix + (name ? name + (ch === "sys" ? " " : ": ") : "") + "#{" + color + "}" + text;
+                    try {
+                        sp.browser.setVisible(true);
+                        sp.storage["voaForceBrowser"] = true;
+                        sp.storage["voaChatLogUntil"] = Date.now() + 180000;
+                    } catch (eVis) {}
+                    try {
+                        var arr = [];
+                        var raw = sp.storage["voaChatUiPendingJson"];
+                        if (typeof raw === "string" && raw.length) {
+                            try { arr = JSON.parse(raw); } catch (eP) { arr = []; }
+                        }
+                        if (!arr || !arr.length) arr = [];
+                        arr.push(msg);
+                        if (arr.length > 40) arr = arr.slice(-40);
+                        sp.storage["voaChatUiPendingJson"] = JSON.stringify(arr);
+                        try { sp.printConsole("VOA chat UI queued (" + arr.length + ")"); } catch (eL) {}
+                    } catch (eQ) {
+                        try { sp.printConsole("VOA chat UI queue err " + eQ); } catch (e3) {}
+                    }
+                };
+
+                var pushLine = function (line) {
+                    if (!line) return;
+                    pushFrontMessage(line);
+                    try {
+                        if (line.channel === "g")
+                            sp.Debug.notification("[G] " + (line.name || "") + ": " + (line.text || ""));
+                        else
+                            sp.printConsole("[" + (line.channel || "L") + "] " + (line.name || "") + ": " + (line.text || ""));
+                    } catch (eN) {}
+                };
+                // Do NOT store pushLine on sp.storage as callable — SP rejects it.
+                // Server eval should only push plain objects into voaChatQueue (JSON).
+
+                var handleRhChat = function (raw) {
+                    var text = String(raw || "").trim();
+                    if (!text) return;
+                    if (text.indexOf("/browserFocused") === 0) {
+                        try { sp.storage["voaChatCloseReq"] = "rh"; sp.storage["voaChatCloseAt"] = Date.now(); } catch (e) {}
+                        return;
+                    }
+                    if (text.indexOf("/focusInputField") === 0) return;
+                    if (/^\/(anim|Craft|Trade|Interaction|SelectBox)\b/i.test(text)) return;
+                    if (/^\/(g|global)\b/i.test(text) && sp.storage["voaIsStaff"] !== true) {
+                        pushLine({ channel: "sys", name: "System", text: "Global chat is Admin only.", system: true });
+                        return;
+                    }
+                    sp.printConsole("VOA chat >> " + text);
+                    pushLine({ channel: "l", name: "You", text: text, system: false });
+                    var ok = sendChat("say", text);
+                    if (!ok) {
+                        pushLine({ channel: "sys", name: "System", text: "Message not sent (not connected yet).", system: true });
+                    }
+                    // Keep input open long enough for browser update to paint the line
+                    try {
+                        sp.storage["voaChatCloseReq"] = "sent";
+                        sp.storage["voaChatCloseAt"] = Date.now() + 600;
+                    } catch (eClose) {}
+                };
+
+                sp.on("update", function () {
+                    // CEF-typed text (queued as JSON string from browserMessage)
+                    try {
+                        var rawP = sp.storage["voaRhChatPendingJson"];
+                        if (rawP && typeof rawP === "string" && rawP !== "[]" && rawP.length > 2) {
+                            sp.storage["voaRhChatPendingJson"] = "[]";
+                            var itemsP = [];
+                            try { itemsP = JSON.parse(rawP); } catch (eJP) { itemsP = []; }
+                            if (itemsP && itemsP.length) {
+                                for (var pi = 0; pi < itemsP.length; pi++) {
+                                    try { handleRhChat(itemsP[pi]); } catch (eP) {
+                                        try { sp.printConsole("VOA chat drain err " + eP); } catch (eP2) {}
+                                    }
+                                }
+                            }
+                        }
+                    } catch (ePend) {}
+                    // Server/gamemode lines: prefer JSON string queue (SP-safe)
+                    try {
+                        var rawQ = sp.storage["voaChatQueueJson"];
+                        if (rawQ && typeof rawQ === "string" && rawQ !== "[]" && rawQ.length > 2) {
+                            sp.storage["voaChatQueueJson"] = "[]";
+                            var lines = [];
+                            try { lines = JSON.parse(rawQ); } catch (eL) { lines = []; }
+                            for (var j = 0; j < lines.length; j++) {
+                                try { pushLine(lines[j]); } catch (eLine) {}
+                            }
+                        }
+                    } catch (eQj) {}
+                    // Legacy array queue (copy then clear — no storage fn calls)
+                    try {
+                        var q2 = sp.storage["voaChatQueue"];
+                        if (q2 && q2.length) {
+                            var qCopy = [];
+                            try { qCopy = JSON.parse(JSON.stringify(q2)); } catch (eCpy) {
+                                qCopy = q2.slice ? q2.slice() : [];
+                            }
+                            sp.storage["voaChatQueue"] = [];
+                            for (var k = 0; k < qCopy.length; k++) {
+                                try { pushLine(qCopy[k]); } catch (e2) {}
+                            }
+                        }
+                    } catch (eAll) {}
+                });
+
+                try {
+                    sp.Utility.wait(1.5).then(function () {
+                        try {
+                            if (typeof sp.storage._voaInstallChatBridge === "function") {
+                                try { sp.storage._voaInstallChatBridge(); } catch (eB) {}
+                            }
+                            sp.printConsole("VOA chat: bridge ready (UI queue v4)");
+                        } catch (eW) {}
+                    });
+                } catch (eU) {}
+
+                sp.printConsole("VOA chat: setup OK v4 (UI via browser COMMAND dispatch)");
+            });
+
+            try {
+                sp.once("update", function () {
+                    try {
+                        setupVoaChat(function () {
+                            try { return sp.storage._voaSendFn || null; } catch (e) { return null; }
+                        }, function (remoteId) {
+                            try {
+                                if (typeof sp.storage._voaRemoteToLocal === "function")
+                                    return sp.storage._voaRemoteToLocal(remoteId);
+                            } catch (e2) {}
+                            return 0;
+                        });
+                    } catch (eSetup) {
+                        try { sp.printConsole("VOA chat auto-setup fail: " + eSetup); } catch (e3) {}
+                    }
+                });
+            } catch (eAuto) {}
+        }
+    };
+});
+System.register("skymp5-client/src/front/index", ["skymp5-client/src/front/skympClient", "skymp5-client/src/front/browser", "skymp5-client/src/front/loadGameManager", "build/dist/client/Data/Platform/Modules/skyrimPlatform", "skymp5-client/src/front/version", "skymp5-client/src/front/worldCleaner", "skymp5-client/src/front/playerInteract", "skymp5-client/src/front/voaChat"], function (exports_37, context_37) {
+    "use strict";
+    var skympClient_1, browser, loadGameManager, skyrimPlatform_18, version_1, worldCleaner_2, playerInteract_1, voaChat_1, enforceLimitations, lastTimeUpd, riftenUnlocked, n, k, zeroKMoment, lastFps;
     var __moduleName = context_37 && context_37.id;
     return {
         setters: [
@@ -4502,12 +6806,85 @@ System.register("skymp5-client/src/front/index", ["skymp5-client/src/front/skymp
             },
             function (worldCleaner_2_1) {
                 worldCleaner_2 = worldCleaner_2_1;
+            },
+            function (playerInteract_1_1) {
+                playerInteract_1 = playerInteract_1_1;
+            },
+            function (voaChat_1_1) {
+                voaChat_1 = voaChat_1_1;
             }
         ],
         execute: function () {
             new skympClient_1.SkympClient();
+            try {
+                if (playerInteract_1 && playerInteract_1.setupPlayerInteract) {
+                    playerInteract_1.setupPlayerInteract(function () {
+                        try {
+                            return skyrimPlatform_18.storage._voaSendFn || null;
+                        }
+                        catch (e) {
+                            return null;
+                        }
+                    }, function (localId) {
+                        try {
+                            if (typeof skyrimPlatform_18.storage._voaLocalToRemote === "function")
+                                return skyrimPlatform_18.storage._voaLocalToRemote(localId);
+                        }
+                        catch (e) { }
+                        return localId;
+                    }, function (remoteId) {
+                        try {
+                            if (typeof skyrimPlatform_18.storage._voaRemoteToLocal === "function")
+                                return skyrimPlatform_18.storage._voaRemoteToLocal(remoteId);
+                        }
+                        catch (e) { }
+                        return 0;
+                    });
+                }
+            }
+            catch (ePi) {
+                try {
+                    skyrimPlatform_18.printConsole("VOA playerInteract setup fail " + ePi);
+                }
+                catch (e2) { }
+            }
+            try {
+                if (voaChat_1 && voaChat_1.setupVoaChat) {
+                    voaChat_1.setupVoaChat(function () {
+                        try {
+                            return skyrimPlatform_18.storage._voaSendFn || null;
+                        }
+                        catch (e) {
+                            return null;
+                        }
+                    }, function (remoteId) {
+                        try {
+                            if (typeof skyrimPlatform_18.storage._voaRemoteToLocal === "function")
+                                return skyrimPlatform_18.storage._voaRemoteToLocal(remoteId);
+                        }
+                        catch (e) { }
+                        return 0;
+                    });
+                }
+            }
+            catch (eCh) {
+                try {
+                    skyrimPlatform_18.printConsole("VOA chat setup fail " + eCh);
+                }
+                catch (e3) { }
+            }
+            // VOA multiplayer limitations:
+            // setInChargen(disableSaving, disableWaiting, showMsg)
+            // Wait (T) must stay OFF so chat can use T; re-apply every frame (loadGame clears it).
             enforceLimitations = function () {
-                skyrimPlatform_18.Game.setInChargen(true, true, false);
+                try {
+                    skyrimPlatform_18.Game.setInChargen(true, true, false);
+                }
+                catch (eChg) { /* ignore */ }
+                try {
+                    skyrimPlatform_18.Game.enableFastTravel(false);
+                }
+                catch (eFt) { /* ignore */ }
             };
             skyrimPlatform_18.once("update", enforceLimitations);
             loadGameManager.addLoadGameListener(enforceLimitations);
@@ -4516,13 +6893,115 @@ System.register("skymp5-client/src/front/index", ["skymp5-client/src/front/skymp
             });
             skyrimPlatform_18.on("update", function () {
                 skyrimPlatform_18.Utility.setINIInt("iDifficulty:GamePlay", 5);
-                skyrimPlatform_18.Game.enableFastTravel(false);
+                enforceLimitations();
+                // Hard-close vanilla Wait/Sleep if it still opens (T key race)
+                try {
+                    if (skyrimPlatform_18.Ui.isMenuOpen("Sleep/Wait Menu")) {
+                        try {
+                            skyrimPlatform_18.callNative("UI", "CloseMenu", null, "Sleep/Wait Menu");
+                        }
+                        catch (eCm1) {
+                            try {
+                                skyrimPlatform_18.callNative("Ui", "CloseMenu", "Sleep/Wait Menu");
+                            }
+                            catch (eCm2) {
+                                try {
+                                    skyrimPlatform_18.Ui.invokeString("Sleep/Wait Menu", "_root.QuestJournalFader.Menu_mc.CloseMenu", "");
+                                }
+                                catch (eInv) { /* ignore */ }
+                            }
+                        }
+                        // Re-assert wait disabled after forced close
+                        try {
+                            skyrimPlatform_18.Game.setInChargen(true, true, false);
+                        }
+                        catch (eRe) { /* ignore */ }
+                    }
+                }
+                catch (eWait) { /* ignore */ }
             });
             browser.main();
             skyrimPlatform_18.once("update", version_1.verifyVersion);
-            skyrimPlatform_18.on("update", function () { return worldCleaner_2.updateWc(); });
+            skyrimPlatform_18.on("update", function () {
+                // Don't burn CPU cleaning while local menus pause the world
+                try {
+                    if (typeof menuPaused !== "undefined" && menuPaused)
+                        return;
+                }
+                catch (eSkip) { }
+                return worldCleaner_2.updateWc();
+            });
+            // VOA: Inventory / Magic (and similar) pause local world for this player.
+            // (Multiplayer often leaves world running ??? we force TimeScale 0 while those menus are open.)
+            // NOTE: Disable SkyrimSoulsRE if present ??? it unpauses menus.
+            var PAUSE_MENUS = [
+                "InventoryMenu",
+                "MagicMenu",
+                "FavoritesMenu",
+                "ContainerMenu",
+                "Crafting Menu",
+                "BarterMenu",
+                "GiftMenu",
+                "Journal Menu",
+                "MapMenu",
+                "StatsMenu",
+                "Book Menu",
+                "Lockpicking Menu",
+                "Training Menu",
+                "TweenMenu",
+                "MessageBoxMenu",
+                "Sleep/Wait Menu",
+            ];
+            var menuPaused = false;
+            var wasMenuPaused = false;
+            var isPauseMenuOpen = function () {
+                try {
+                    for (var mi = 0; mi < PAUSE_MENUS.length; mi++) {
+                        if (skyrimPlatform_18.Ui.isMenuOpen(PAUSE_MENUS[mi]))
+                            return true;
+                    }
+                }
+                catch (eM) { }
+                return false;
+            };
+            var setLocalTimeScale = function (value) {
+                try {
+                    var timeScaleId = 0x3a;
+                    var timeScale = skyrimPlatform_18.GlobalVariable.from(skyrimPlatform_18.Game.getFormEx(timeScaleId));
+                    if (timeScale)
+                        timeScale.setValue(value);
+                }
+                catch (eTs) { }
+                try {
+                    skyrimPlatform_18.Game.setGameSettingFloat("fTimescaleMult", value === 0 ? 0.0 : 1.0);
+                }
+                catch (eGs) { }
+            };
+            skyrimPlatform_18.on("update", function () {
+                menuPaused = isPauseMenuOpen();
+                if (menuPaused) {
+                    setLocalTimeScale(0);
+                    if (!wasMenuPaused) {
+                        try {
+                            skyrimPlatform_18.printConsole("VOA: menu open ??? local world paused (TimeScale 0)");
+                        }
+                        catch (eP) { }
+                    }
+                }
+                else if (wasMenuPaused) {
+                    setLocalTimeScale(1);
+                    try {
+                        skyrimPlatform_18.printConsole("VOA: menu closed ??? local world unpaused");
+                    }
+                    catch (eU) { }
+                }
+                wasMenuPaused = menuPaused;
+            });
             lastTimeUpd = 0;
             skyrimPlatform_18.on("update", function () {
+                // Do not fight menu pause with real-time clock / timescale=1
+                if (menuPaused)
+                    return;
                 if (Date.now() - lastTimeUpd <= 2000)
                     return;
                 lastTimeUpd = Date.now();

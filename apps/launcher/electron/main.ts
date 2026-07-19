@@ -6,6 +6,8 @@ import {
   dialog,
   safeStorage,
   clipboard,
+  Menu,
+  protocol,
 } from "electron";
 import crypto from "crypto";
 import fs from "fs";
@@ -13,10 +15,34 @@ import http from "http";
 import https from "https";
 import path from "path";
 import { spawn, execFile } from "child_process";
-import { URL } from "url";
+import { URL, pathToFileURL } from "url";
 import { promisify } from "util";
+import {
+  defaultInstancePath,
+  ensureVoaInstance,
+  isValidGameRoot,
+  writeFileExclusive,
+  type InstanceProgress,
+} from "./voaInstance";
 
 const execFileAsync = promisify(execFile);
+
+// Must be set before app ready — allows BGM autoplay without a click
+app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+
+// Custom media scheme so <audio> can stream from resources/ outside asar
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: "voa-media",
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      stream: true,
+      bypassCSP: true,
+    },
+  },
+]);
 
 /** Official public platform API (players). Override with VOA_API_URL for local dev. */
 const PUBLIC_API_URL = "http://178.156.158.116:3100";
@@ -192,53 +218,648 @@ async function ensureApiRunning(): Promise<boolean> {
   return await pingApi();
 }
 
-/** Bundled SkyMP client plugin shipped with the player launcher */
-function bundledClientDir(): string | null {
+/** Bundled SkyMP client plugin shipped with the player launcher (offline fallback) */
+function bundledClientPath(): string | null {
   const candidates = [
-    process.resourcesPath ? path.join(process.resourcesPath, "client") : "",
-    path.resolve(__dirname, "../../../client-dist"),
-    path.resolve(__dirname, "../../client-dist"),
+    process.resourcesPath
+      ? path.join(process.resourcesPath, "client", "skymp5-client.js")
+      : "",
+    path.resolve(__dirname, "../../../client-dist/skymp5-client.js"),
+    path.resolve(__dirname, "../../client-dist/skymp5-client.js"),
   ].filter(Boolean);
   for (const c of candidates) {
-    if (fs.existsSync(path.join(c, "skymp5-client.js"))) return c;
+    if (fs.existsSync(c)) return c;
   }
   return null;
 }
 
 /**
- * Install / refresh the VOA multiplayer client plugin into Skyrim.
- * Safe for public players — only writes known client files under Platform/Plugins.
+ * Download text body from API_BASE path (Node http/https).
  */
-function ensureClientPlugin(skyrim: string): { ok: boolean; error?: string; path?: string } {
-  const srcDir = bundledClientDir();
-  if (!srcDir) {
-    return {
-      ok: false,
-      error:
-        "Launcher is missing the VOA client package. Re-download the official release.",
-    };
-  }
-  const destDir = path.join(skyrim, "Data", "Platform", "Plugins");
+function downloadTextFromApi(
+  urlPath: string,
+  timeoutMs = 60_000
+): Promise<{ ok: boolean; status: number; text: string }> {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(urlPath, API_BASE.endsWith("/") ? API_BASE : API_BASE + "/");
+      const lib = u.protocol === "https:" ? https : http;
+      const req = lib.get(
+        {
+          protocol: u.protocol,
+          hostname: u.hostname,
+          port: u.port,
+          path: u.pathname + u.search,
+          headers: { Accept: "application/javascript,text/plain,*/*" },
+          timeout: timeoutMs,
+        },
+        (res) => {
+          if (
+            res.statusCode &&
+            res.statusCode >= 300 &&
+            res.statusCode < 400 &&
+            res.headers.location
+          ) {
+            const next = new URL(res.headers.location, u).toString();
+            downloadTextFromApi(next, timeoutMs).then(resolve);
+            res.resume();
+            return;
+          }
+          const chunks: Buffer[] = [];
+          res.on("data", (c) => chunks.push(Buffer.from(c)));
+          res.on("end", () => {
+            resolve({
+              ok: Boolean(res.statusCode && res.statusCode >= 200 && res.statusCode < 300),
+              status: res.statusCode || 0,
+              text: Buffer.concat(chunks).toString("utf8"),
+            });
+          });
+        }
+      );
+      req.on("timeout", () => {
+        req.destroy();
+        resolve({ ok: false, status: 0, text: "timeout" });
+      });
+      req.on("error", (e) =>
+        resolve({ ok: false, status: 0, text: e.message || String(e) })
+      );
+    } catch (e: any) {
+      resolve({ ok: false, status: 0, text: e?.message || String(e) });
+    }
+  });
+}
+
+/**
+ * Known-good SkyrimPlatformImpl size for SP-AE pack used with 1.6.1170
+ * (tmp-sp-ae-clean). Wrong size → REL/Relocation.h unexpected format.
+ */
+const SP_IMPL_GOOD_SIZE = 14801408;
+
+/**
+ * Lean SKSE stack for VOA: only SP + MpClient + Address Library 1170.
+ * EngineFixes / CrashLogger / SkyPatcher etc. cause SP REL crashes on AE.
+ * Also reinstall matched SkyrimPlatformImpl when size is wrong (hardlink rebuild pollution).
+ */
+function ensureLeanSpStack(skyrim: string): string[] {
+  const cleaned: string[] = [];
+  const plug = path.join(skyrim, "Data", "SKSE", "Plugins");
   try {
+    fs.mkdirSync(plug, { recursive: true });
+  } catch {
+    return cleaned;
+  }
+
+  const keepExact = new Set(
+    [
+      "skyrimplatform.dll",
+      "skyrimplatform.ini",
+      "mpclientplugin.dll",
+      "spdlog.dll",
+      "fmt.dll",
+      "versionlib-1-6-1170-0.bin",
+      "versionlib-1-6-1170-0-1.bin",
+      "version-1-6-1170-0.bin",
+      "versionlib-1-6-1170.bin",
+      "versionlib_1_6_1170_0.bin",
+    ].map((s) => s.toLowerCase())
+  );
+  const quarantine = path.join(
+    plug,
+    `_voa-lean-${new Date().toISOString().slice(0, 10)}`
+  );
+
+  try {
+    for (const ent of fs.readdirSync(plug, { withFileTypes: true })) {
+      if (!ent.isFile()) continue;
+      const n = ent.name;
+      const nl = n.toLowerCase();
+      if (keepExact.has(nl)) continue;
+      if (
+        nl.includes("versionlib") &&
+        (nl.includes("1-6-1170") || nl.includes("1_6_1170"))
+      ) {
+        continue;
+      }
+      if (nl.startsWith("version-1-6-1170")) continue;
+      // Keep already-disabled markers out of the way
+      if (nl.includes("disabled") || nl.startsWith("_")) continue;
+      try {
+        fs.mkdirSync(quarantine, { recursive: true });
+        const from = path.join(plug, n);
+        const to = path.join(quarantine, n);
+        // Break hardlink
+        try {
+          fs.unlinkSync(to);
+        } catch {
+          /* ignore */
+        }
+        fs.renameSync(from, to);
+        cleaned.push(n);
+      } catch {
+        try {
+          fs.copyFileSync(path.join(plug, n), path.join(quarantine, n));
+          fs.unlinkSync(path.join(plug, n));
+          cleaned.push(n);
+        } catch {
+          /* locked */
+        }
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  // Fix mismatched Impl (common after full clone / Verify Files)
+  const impl = path.join(
+    skyrim,
+    "Data",
+    "Platform",
+    "Distribution",
+    "RuntimeDependencies",
+    "SkyrimPlatformImpl.dll"
+  );
+  let needImpl = true;
+  try {
+    if (fs.existsSync(impl) && fs.statSync(impl).size === SP_IMPL_GOOD_SIZE) {
+      needImpl = false;
+    }
+  } catch {
+    needImpl = true;
+  }
+  if (needImpl) {
+    const candidates = [
+      // Dev monorepo packs
+      path.resolve(
+        __dirname,
+        "../../../tmp-sp-ae-clean/Platform/Distribution/RuntimeDependencies/SkyrimPlatformImpl.dll"
+      ),
+      path.resolve(
+        __dirname,
+        "../../../tmp-sp-ae/Platform/Distribution/RuntimeDependencies/SkyrimPlatformImpl.dll"
+      ),
+      path.resolve(
+        process.cwd(),
+        "tmp-sp-ae-clean/Platform/Distribution/RuntimeDependencies/SkyrimPlatformImpl.dll"
+      ),
+      path.join(
+        app.getPath("userData"),
+        "sp-ae",
+        "SkyrimPlatformImpl.dll"
+      ),
+    ];
+    for (const c of candidates) {
+      try {
+        if (!fs.existsSync(c)) continue;
+        if (fs.statSync(c).size !== SP_IMPL_GOOD_SIZE) continue;
+        fs.mkdirSync(path.dirname(impl), { recursive: true });
+        try {
+          fs.unlinkSync(impl);
+        } catch {
+          /* ignore */
+        }
+        fs.copyFileSync(c, impl);
+        cleaned.push("SkyrimPlatformImpl.dll (matched pack restored)");
+        needImpl = false;
+        break;
+      } catch {
+        /* try next */
+      }
+    }
+    if (needImpl) {
+      cleaned.push(
+        "WARN: SkyrimPlatformImpl.dll size mismatch — reinstall multiplayer/SP package"
+      );
+    }
+  }
+
+  // SP + MpClient from monorepo pack if present and missing
+  const spDll = path.join(plug, "SkyrimPlatform.dll");
+  const mpDll = path.join(plug, "MpClientPlugin.dll");
+  const packRoots = [
+    path.resolve(__dirname, "../../../tmp-sp-ae-clean"),
+    path.resolve(__dirname, "../../../tmp-sp-ae"),
+  ];
+  for (const root of packRoots) {
+    const spSrc = path.join(root, "SKSE", "Plugins", "SkyrimPlatform.dll");
+    const mpSrc = path.join(root, "SKSE", "Plugins", "MpClientPlugin.dll");
+    try {
+      if (fs.existsSync(spSrc) && (!fs.existsSync(spDll) || fs.statSync(spDll).size !== fs.statSync(spSrc).size)) {
+        try {
+          fs.unlinkSync(spDll);
+        } catch {
+          /* ignore */
+        }
+        fs.copyFileSync(spSrc, spDll);
+        cleaned.push("SkyrimPlatform.dll (restored)");
+      }
+      if (fs.existsSync(mpSrc) && !fs.existsSync(mpDll)) {
+        fs.copyFileSync(mpSrc, mpDll);
+        cleaned.push("MpClientPlugin.dll (restored)");
+      }
+      // Full RuntimeDependencies if Impl was restored from this pack
+      const rdSrc = path.join(root, "Platform", "Distribution", "RuntimeDependencies");
+      const rdDst = path.join(
+        skyrim,
+        "Data",
+        "Platform",
+        "Distribution",
+        "RuntimeDependencies"
+      );
+      if (fs.existsSync(rdSrc) && fs.existsSync(path.join(rdSrc, "SkyrimPlatformImpl.dll"))) {
+        fs.mkdirSync(rdDst, { recursive: true });
+        for (const f of fs.readdirSync(rdSrc)) {
+          const from = path.join(rdSrc, f);
+          const to = path.join(rdDst, f);
+          try {
+            if (!fs.statSync(from).isFile()) continue;
+            try {
+              fs.unlinkSync(to);
+            } catch {
+              /* ignore */
+            }
+            fs.copyFileSync(from, to);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      break;
+    } catch {
+      /* try next pack */
+    }
+  }
+
+  return cleaned;
+}
+
+/**
+ * Install multiplayer join files into the *playable* Skyrim root (VOA instance by default):
+ * - skymp5-client.js (prefer live VPS/API copy)
+ * - password under Platform/Distribution
+ * - SkyrimPlatform.ini (console + plugin folders)
+ * - empty PluginsDev; strip non-VOA junk scripts from Plugins
+ * Uses exclusive writes so hardlinked Steam files are never mutated.
+ */
+async function installVoaGameFiles(
+  skyrim: string
+): Promise<{
+  ok: boolean;
+  error?: string;
+  clientPath?: string;
+  source?: "vps" | "bundled";
+  clientBytes?: number;
+  cleanedPlugins?: string[];
+}> {
+  const destDir = path.join(skyrim, "Data", "Platform", "Plugins");
+  const destJs = path.join(destDir, "skymp5-client.js");
+  const cleaned: string[] = [];
+  try {
+    // Always lean-strip before launch (Verify Files / mod install reintroduce EngineFixes)
+    cleaned.push(...ensureLeanSpStack(skyrim));
+
     fs.mkdirSync(destDir, { recursive: true });
-    const srcJs = path.join(srcDir, "skymp5-client.js");
-    const destJs = path.join(destDir, "skymp5-client.js");
-    fs.copyFileSync(srcJs, destJs);
-    return { ok: true, path: destJs };
+    fs.mkdirSync(path.join(skyrim, "Data", "Platform", "PluginsDev"), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(skyrim, "Data", "Platform", "PluginsNoLoad"), {
+      recursive: true,
+    });
+
+    let body = "";
+    let source: "vps" | "bundled" = "bundled";
+
+    // 1) Prefer live client from VOA API (same file game server ClientVerify uses)
+    const remote = await downloadTextFromApi("/v1/client/skymp5-client.js");
+    if (remote.ok && remote.text && remote.text.length > 10_000) {
+      body = remote.text;
+      source = "vps";
+    } else {
+      // 2) Fallback: launcher-bundled client
+      const bundled = bundledClientPath();
+      if (!bundled) {
+        return {
+          ok: false,
+          error:
+            "Could not download multiplayer client from the VOA server, and this launcher has no bundled client. Check your connection or re-download the launcher.",
+        };
+      }
+      body = fs.readFileSync(bundled, "utf8");
+      source = "bundled";
+    }
+
+    // Exclusive write (break hardlinks so the main Skyrim install is never modified)
+    writeFileExclusive(destJs, body, "utf8");
+
+    // Networking password (SkyMP SLikeNet) — always enforce
+    const distDir = path.join(skyrim, "Data", "Platform", "Distribution");
+    fs.mkdirSync(distDir, { recursive: true });
+    writeFileExclusive(path.join(distDir, "password"), "2", "utf8");
+
+    // Unbind vanilla Wait from T (DIK 0x14) so VOA chat can use T.
+    // Full controlmap override under Data/Interface/Controls/PC/
+    try {
+      const controlmapCandidates = [
+        path.join(process.resourcesPath || "", "client", "Interface", "Controls", "PC", "controlmap.txt"),
+        path.resolve(__dirname, "../../../client-dist/Interface/Controls/PC/controlmap.txt"),
+        path.resolve(__dirname, "../../client-dist/Interface/Controls/PC/controlmap.txt"),
+        path.resolve(
+          __dirname,
+          "../../../../deploy/assets/Interface/Controls/PC/controlmap.txt"
+        ),
+      ];
+      let controlmapSrc = "";
+      for (const c of controlmapCandidates) {
+        try {
+          if (c && fs.existsSync(c)) {
+            controlmapSrc = c;
+            break;
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+      if (controlmapSrc) {
+        const mapDir = path.join(skyrim, "Data", "Interface", "Controls", "PC");
+        fs.mkdirSync(mapDir, { recursive: true });
+        writeFileExclusive(
+          path.join(mapDir, "controlmap.txt"),
+          fs.readFileSync(controlmapSrc, "utf8"),
+          "utf8"
+        );
+        cleaned.push("controlmap.txt(Wait unbound)");
+      }
+      // In-game rebinds write controlmap_custom.txt and would re-bind Wait to T
+      for (const custom of [
+        path.join(skyrim, "controlmap_custom.txt"),
+        path.join(skyrim, "Data", "controlmap_custom.txt"),
+      ]) {
+        try {
+          if (fs.existsSync(custom)) {
+            fs.unlinkSync(custom);
+            cleaned.push(path.basename(custom));
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // SkyrimSoulsRE keeps menus unpaused — conflicts with VOA menu pause. Disable while playing VOA.
+    try {
+      const souls = path.join(skyrim, "Data", "SKSE", "Plugins", "SkyrimSoulsRE.dll");
+      const soulsOff = souls + ".voa-disabled";
+      if (fs.existsSync(souls) && !fs.existsSync(soulsOff)) {
+        fs.renameSync(souls, soulsOff);
+        cleaned.push("SkyrimSoulsRE.dll");
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // Ensure SP loads Plugins + shows console (Hello Multiplayer / connect logs)
+    const spIni = path.join(skyrim, "Data", "SKSE", "Plugins", "SkyrimPlatform.ini");
+    try {
+      fs.mkdirSync(path.dirname(spIni), { recursive: true });
+      writeFileExclusive(
+        spIni,
+        [
+          "[Debug]",
+          "LogLevel = 0",
+          "Cmd = true",
+          "CmdOffsetLeft = 0",
+          "CmdOffsetTop = 600",
+          "CmdWidth = 900",
+          "CmdHeight = 350",
+          "CmdIsAlwaysOnTop = false",
+          // CEF ON — required for VOA chat box, radial menu, announce popup overlays
+          // (lean matched SP stack; keep false only if Chromium crashes on your machine)
+          "ChromiumEnabled = true",
+          "",
+          "[Main]",
+          "PluginFolders = Data/Platform/Plugins;Data/Platform/PluginsDev",
+          "",
+        ].join("\r\n"),
+        "utf8"
+      );
+    } catch {
+      /* ignore */
+    }
+
+    // SP loads EVERY file in Plugins except *-settings.txt / *-logs.txt.
+    // Move non-VOA scripts out so only the multiplayer client runs.
+    const keep = new Set([
+      "skymp5-client.js",
+      "skymp5-client-settings.txt",
+    ]);
+    const quarantine = path.join(
+      skyrim,
+      "Data",
+      "Platform",
+      "PluginsNoLoad",
+      `_voa-quarantine-${Date.now()}`
+    );
+    for (const ent of fs.readdirSync(destDir, { withFileTypes: true })) {
+      if (keep.has(ent.name)) continue;
+      if (ent.name.startsWith(".")) continue;
+      try {
+        fs.mkdirSync(quarantine, { recursive: true });
+        fs.renameSync(path.join(destDir, ent.name), path.join(quarantine, ent.name));
+        cleaned.push(ent.name);
+      } catch {
+        /* ignore locked files */
+      }
+    }
+
+    return {
+      ok: true,
+      clientPath: destJs,
+      source,
+      clientBytes: Buffer.byteLength(body, "utf8"),
+      cleanedPlugins: cleaned,
+    };
   } catch (e: any) {
     return { ok: false, error: e?.message || String(e) };
   }
 }
 
+function playLog(line: string): void {
+  try {
+    const p = path.join(app.getPath("userData"), "voa-play.log");
+    fs.appendFileSync(
+      p,
+      `[${new Date().toISOString()}] ${line}\n`,
+      "utf8"
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
+/** True if a process with this image name is running (Windows). */
+function isProcessRunning(imageName: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    execFile(
+      "tasklist",
+      ["/FI", `IMAGENAME eq ${imageName}`, "/NH"],
+      { windowsHide: true, timeout: 8000 },
+      (err, stdout) => {
+        if (err) {
+          resolve(false);
+          return;
+        }
+        const out = String(stdout || "").toLowerCase();
+        resolve(out.includes(imageName.toLowerCase()));
+      }
+    );
+  });
+}
+
+async function waitForGameProcess(timeoutMs = 12_000): Promise<{
+  seen: boolean;
+  which?: string;
+}> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await isProcessRunning("SkyrimSE.exe")) {
+      return { seen: true, which: "SkyrimSE.exe" };
+    }
+    if (await isProcessRunning("skse64_loader.exe")) {
+      return { seen: true, which: "skse64_loader.exe" };
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  return { seen: false };
+}
+
+/**
+ * Start skse64_loader.exe with the Skyrim install as process working directory.
+ * Address Library opens Data/SKSE/Plugins/versionlib-*.bin relative to CWD.
+ * Primary: spawn loader directly with cwd (most reliable).
+ * Fallback: cmd start /D. Verifies a game process appears or returns an error.
+ */
+async function launchSkseMultiplayer(
+  skyrim: string,
+  loaderPath: string
+): Promise<{ ok: boolean; error?: string; method?: string }> {
+  const gameDir = path.resolve(skyrim.replace(/[\\/]+$/, ""));
+  if (!fs.existsSync(loaderPath)) {
+    return { ok: false, error: `skse64_loader.exe not found in ${gameDir}` };
+  }
+  if (!fs.existsSync(path.join(gameDir, "SkyrimSE.exe"))) {
+    return {
+      ok: false,
+      error: `SkyrimSE.exe not found in ${gameDir}. Set the real Skyrim SE folder in Settings (the folder that contains SkyrimSE.exe).`,
+    };
+  }
+
+  playLog(`launch begin dir=${gameDir} loader=${loaderPath}`);
+
+  const alreadyRunning = await isProcessRunning("SkyrimSE.exe");
+  if (alreadyRunning) {
+    playLog("SkyrimSE.exe already running — treating as success");
+    return {
+      ok: true,
+      method: "already-running",
+    };
+  }
+
+  // --- Primary: direct spawn with CWD = game root (matches successful manual Start-Process) ---
+  try {
+    const child = spawn(loaderPath, [], {
+      cwd: gameDir,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: false,
+      env: { ...process.env },
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      // Give spawn a tick to fail on ENOENT etc.
+      setTimeout(resolve, 200);
+    });
+    child.unref();
+    playLog("spawned skse64_loader (direct)");
+    const check = await waitForGameProcess(10_000);
+    if (check.seen) {
+      playLog(`ok direct process=${check.which}`);
+      return { ok: true, method: "spawn-cwd" };
+    }
+    playLog("direct spawn: no Skyrim/SKSE process within 10s — trying start /D fallback");
+  } catch (e: any) {
+    playLog(`direct spawn error: ${e?.message || e}`);
+  }
+
+  // --- Fallback: cmd start /D (forces working directory for some Windows setups) ---
+  try {
+    const q = (p: string) => `"${p.replace(/"/g, '""')}"`;
+    const cmdLine = `start "" /D ${q(gameDir)} ${q(loaderPath)}`;
+    const child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/c", cmdLine], {
+      cwd: gameDir,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      setTimeout(resolve, 200);
+    });
+    child.unref();
+    playLog("spawned via cmd start /D");
+    const check = await waitForGameProcess(10_000);
+    if (check.seen) {
+      playLog(`ok start/D process=${check.which}`);
+      return { ok: true, method: "start-d" };
+    }
+    playLog("start /D: no process within 10s");
+  } catch (e: any) {
+    playLog(`start /D error: ${e?.message || e}`);
+  }
+
+  return {
+    ok: false,
+    error:
+      "SKSE did not start (no SkyrimSE.exe / skse64_loader window). " +
+      "Check: Steam is running and you own Skyrim SE; antivirus is not blocking skse64_loader.exe; " +
+      "SKSE 2.2.6 is installed in the Skyrim folder; Settings → Skyrim path is correct. " +
+      `Log: ${path.join(app.getPath("userData"), "voa-play.log")}`,
+  };
+}
+
 const storePath = () => path.join(app.getPath("userData"), "voa-store.json");
+
+type NexusUserInfo = {
+  userId?: number;
+  name?: string;
+  isPremium?: boolean;
+  isSupporter?: boolean;
+};
 
 type Store = {
   accessToken?: string;
   refreshToken?: string;
   user?: unknown;
+  /** User's main Skyrim install (source). Not written by VOA Play when instance mode is on. */
   skyrimPath?: string;
+  /**
+   * Dedicated VOA game tree (hardlinks/copies from skyrimPath).
+   * Play + mod install target this folder so the main install stays untouched.
+   */
+  voaInstancePath?: string;
+  /** Default true — use isolated VOA folder. Set false only for advanced users. */
+  useVoaInstance?: boolean;
   /** Selected character slot 0|1 for next Play */
   characterSlot?: number;
+  /** Nexus OAuth access token (Bearer) — from browser login, not API key paste */
+  nexusAccessToken?: string;
+  nexusRefreshToken?: string;
+  /** Unix ms when access token expires */
+  nexusTokenExpiresAt?: number;
+  nexusUser?: NexusUserInfo | null;
+  /** Launcher background music (0–100). Ready for track drop-in. */
+  musicVolume?: number;
+  musicMuted?: boolean;
 };
 
 function readStore(): Store {
@@ -248,6 +869,11 @@ function readStore(): Store {
     const raw = JSON.parse(fs.readFileSync(p, "utf8")) as Store & {
       encAccess?: string;
       encRefresh?: string;
+      encNexusAccess?: string;
+      encNexusRefresh?: string;
+      /** legacy personal API key (migrated away) */
+      encNexusKey?: string;
+      nexusApiKey?: string;
     };
     const out: Store = { ...raw };
     if (raw.encAccess && safeStorage.isEncryptionAvailable()) {
@@ -256,8 +882,22 @@ function readStore(): Store {
     if (raw.encRefresh && safeStorage.isEncryptionAvailable()) {
       out.refreshToken = safeStorage.decryptString(Buffer.from(raw.encRefresh, "base64"));
     }
+    if (raw.encNexusAccess && safeStorage.isEncryptionAvailable()) {
+      out.nexusAccessToken = safeStorage.decryptString(
+        Buffer.from(raw.encNexusAccess, "base64")
+      );
+    }
+    if (raw.encNexusRefresh && safeStorage.isEncryptionAvailable()) {
+      out.nexusRefreshToken = safeStorage.decryptString(
+        Buffer.from(raw.encNexusRefresh, "base64")
+      );
+    }
     delete (out as { encAccess?: string }).encAccess;
     delete (out as { encRefresh?: string }).encRefresh;
+    delete (out as { encNexusAccess?: string }).encNexusAccess;
+    delete (out as { encNexusRefresh?: string }).encNexusRefresh;
+    delete (out as { encNexusKey?: string }).encNexusKey;
+    delete (out as { nexusApiKey?: string }).nexusApiKey;
     return out;
   } catch {
     return {};
@@ -277,13 +917,29 @@ function writeStore(partial: Store): void {
   const toWrite: Record<string, unknown> = {
     user: next.user ?? null,
     skyrimPath: next.skyrimPath ?? null,
+    voaInstancePath: next.voaInstancePath ?? null,
+    nexusUser: next.nexusUser ?? null,
   };
+  if (typeof next.useVoaInstance === "boolean") {
+    toWrite.useVoaInstance = next.useVoaInstance;
+  }
   if (typeof next.characterSlot === "number") {
     toWrite.characterSlot = next.characterSlot;
+  }
+  if (typeof next.nexusTokenExpiresAt === "number") {
+    toWrite.nexusTokenExpiresAt = next.nexusTokenExpiresAt;
+  }
+  if (typeof next.musicVolume === "number") {
+    toWrite.musicVolume = Math.max(0, Math.min(100, Math.round(next.musicVolume)));
+  }
+  if (typeof next.musicMuted === "boolean") {
+    toWrite.musicMuted = next.musicMuted;
   }
 
   const access = next.accessToken || "";
   const refresh = next.refreshToken || "";
+  const nexusAccess = next.nexusAccessToken || "";
+  const nexusRefresh = next.nexusRefreshToken || "";
 
   if (safeStorage.isEncryptionAvailable()) {
     if (access) {
@@ -292,9 +948,17 @@ function writeStore(partial: Store): void {
     if (refresh) {
       toWrite.encRefresh = safeStorage.encryptString(refresh).toString("base64");
     }
+    if (nexusAccess) {
+      toWrite.encNexusAccess = safeStorage.encryptString(nexusAccess).toString("base64");
+    }
+    if (nexusRefresh) {
+      toWrite.encNexusRefresh = safeStorage.encryptString(nexusRefresh).toString("base64");
+    }
   } else {
     if (access) toWrite.accessToken = access;
     if (refresh) toWrite.refreshToken = refresh;
+    if (nexusAccess) toWrite.nexusAccessToken = nexusAccess;
+    if (nexusRefresh) toWrite.nexusRefreshToken = nexusRefresh;
   }
 
   fs.mkdirSync(path.dirname(storePath()), { recursive: true });
@@ -312,6 +976,90 @@ function detectSkyrimPath(): string | null {
     if (fs.existsSync(path.join(c, "SkyrimSE.exe"))) return c;
   }
   return null;
+}
+
+function getSourceSkyrimPath(): string | null {
+  const s = readStore();
+  if (s.skyrimPath && isValidGameRoot(s.skyrimPath)) return path.resolve(s.skyrimPath);
+  const detected = detectSkyrimPath();
+  return detected ? path.resolve(detected) : null;
+}
+
+function emitInstanceProgress(p: InstanceProgress): void {
+  try {
+    mainWindow?.webContents.send("instance:progress", p);
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Playable root: isolated VOA instance (default) or direct base path if user disabled isolation.
+ */
+function resolvePlayableSkyrim(opts?: {
+  forceRebuild?: boolean;
+}): {
+  ok: boolean;
+  path?: string;
+  sourcePath?: string;
+  usingInstance?: boolean;
+  created?: boolean;
+  reused?: boolean;
+  hardlinked?: number;
+  copied?: number;
+  error?: string;
+} {
+  const source = getSourceSkyrimPath();
+  if (!source) {
+    return {
+      ok: false,
+      error:
+        "Base Skyrim folder not set. In Settings, Browse to your Steam Skyrim Special Edition folder (the one with SkyrimSE.exe).",
+    };
+  }
+  const store = readStore();
+  const useInstance = store.useVoaInstance !== false;
+  if (!useInstance) {
+    return { ok: true, path: source, sourcePath: source, usingInstance: false };
+  }
+
+  const instancePath =
+    store.voaInstancePath &&
+    path.resolve(store.voaInstancePath).toLowerCase() !== source.toLowerCase()
+      ? path.resolve(store.voaInstancePath)
+      : defaultInstancePath(source, app.getPath("userData"));
+
+  const res = ensureVoaInstance({
+    sourcePath: source,
+    instancePath,
+    userData: app.getPath("userData"),
+    force: Boolean(opts?.forceRebuild),
+    // Multiplayer-safe: vanilla DLC + SKSE essentials only (no full modlist clone)
+    mode: "lean",
+    onProgress: emitInstanceProgress,
+  });
+  if (!res.ok || !res.path) {
+    return {
+      ok: false,
+      error: res.error || "Failed to prepare VOA game folder",
+      sourcePath: source,
+      usingInstance: true,
+    };
+  }
+  writeStore({ voaInstancePath: res.path, useVoaInstance: true });
+  playLog(
+    `instance ok path=${res.path} created=${Boolean(res.created)} reused=${Boolean(res.reused)} hl=${res.hardlinked ?? 0} cp=${res.copied ?? 0}`
+  );
+  return {
+    ok: true,
+    path: res.path,
+    sourcePath: source,
+    usingInstance: true,
+    created: res.created,
+    reused: res.reused,
+    hardlinked: res.hardlinked,
+    copied: res.copied,
+  };
 }
 
 function resolveAppIcon(): string | undefined {
@@ -333,6 +1081,8 @@ function resolveAppIcon(): string | undefined {
 
 function createWindow() {
   const icon = resolveAppIcon();
+  // No File/Edit/View menu bar; custom in-app chrome for close.
+  Menu.setApplicationMenu(null);
   mainWindow = new BrowserWindow({
     width: 1100,
     height: 720,
@@ -340,6 +1090,8 @@ function createWindow() {
     minHeight: 600,
     backgroundColor: "#0f1115",
     title: "Visions of Aetherius",
+    frame: false,
+    autoHideMenuBar: true,
     ...(icon ? { icon } : {}),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -347,6 +1099,21 @@ function createWindow() {
       nodeIntegration: false,
     },
   });
+
+  // Chromium autoplay: also set on session (covers media elements)
+  try {
+    mainWindow.webContents.session.setPermissionRequestHandler(
+      (_wc, permission, callback) => {
+        if (permission === "media" || permission === "mediaKeySystem") {
+          callback(true);
+          return;
+        }
+        callback(false);
+      }
+    );
+  } catch {
+    /* ignore */
+  }
 
   if (process.env.VITE_DEV_SERVER_URL) {
     mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
@@ -497,7 +1264,8 @@ function startAuthLoopback() {
         res.end(
           htmlAuthPage(
             "Login failed",
-            `Discord returned: ${err}. Close this tab and try Login again in the launcher.`
+            `Discord returned: ${err}. Close this tab and try Login again in the launcher.`,
+            false
           )
         );
         return;
@@ -505,7 +1273,7 @@ function startAuthLoopback() {
       if (!code || !state) {
         res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
         res.end(
-          htmlAuthPage("Login failed", "Missing code/state. Close this tab and try again.")
+          htmlAuthPage("Login failed", "Missing code/state. Close this tab and try again.", false)
         );
         return;
       }
@@ -517,7 +1285,8 @@ function startAuthLoopback() {
             htmlAuthPage(
               "Login failed",
               (ex.error || "Exchange failed") +
-                " Close this tab and try again from the launcher."
+                " Close this tab and try again from the launcher.",
+              false
             )
           );
           return;
@@ -597,6 +1366,17 @@ app.on("open-url", (event, url) => {
 
 app.whenReady().then(async () => {
   registerVoaProtocol();
+
+  // Serve BGM from disk via voa-media://bgm (reliable outside asar)
+  protocol.registerFileProtocol("voa-media", (request, callback) => {
+    const musicPath = resolveMusicFilePath();
+    if (musicPath) {
+      callback({ path: musicPath });
+      return;
+    }
+    callback({ error: -6 }); // FILE_NOT_FOUND
+  });
+
   // Boot local VOA API if needed (Play/status depend on it)
   await ensureApiRunning();
 
@@ -627,6 +1407,439 @@ ipcMain.handle("voa:getApiBase", () => API_BASE);
 
 ipcMain.handle("voa:getAppVersion", () => app.getVersion());
 
+ipcMain.handle("voa:windowClose", () => {
+  const win = BrowserWindow.getFocusedWindow() || mainWindow;
+  win?.close();
+  return true;
+});
+
+ipcMain.handle("voa:windowMinimize", () => {
+  const win = BrowserWindow.getFocusedWindow() || mainWindow;
+  win?.minimize();
+  return true;
+});
+
+/**
+ * Resolve launcher BGM on disk (not via broken absolute /music URL in asar).
+ * Packaged: extraResources → resources/music/launcher-theme.mp3
+ */
+function resolveMusicFilePath(): string | null {
+  const candidates = [
+    path.join(process.resourcesPath || "", "music", "launcher-theme.mp3"),
+    path.join(app.getAppPath(), "dist", "music", "launcher-theme.mp3"),
+    path.join(app.getAppPath(), "public", "music", "launcher-theme.mp3"),
+    path.join(__dirname, "..", "dist", "music", "launcher-theme.mp3"),
+    path.join(__dirname, "..", "public", "music", "launcher-theme.mp3"),
+    // asarUnpack fallback
+    path.join(
+      process.resourcesPath || "",
+      "app.asar.unpacked",
+      "dist",
+      "music",
+      "launcher-theme.mp3"
+    ),
+  ];
+  for (const p of candidates) {
+    try {
+      if (p && fs.existsSync(p) && fs.statSync(p).size > 1000) return p;
+    } catch {
+      /* continue */
+    }
+  }
+  return null;
+}
+
+ipcMain.handle("voa:getMusicSrc", () => {
+  const filePath = resolveMusicFilePath();
+  if (!filePath) {
+    return {
+      ok: false,
+      src: null as string | null,
+      error: "Music file not found (expected resources/music/launcher-theme.mp3)",
+    };
+  }
+  // Prefer privileged custom scheme (works with asar-loaded UI); file:// as fallback
+  return {
+    ok: true,
+    src: "voa-media://bgm",
+    path: filePath,
+    fileUrl: pathToFileURL(filePath).href,
+  };
+});
+
+/**
+ * Nexus Mods OAuth2 + PKCE (browser login — same idea as Discord).
+ * Public clients: no client secret. Client ID must be registered with Nexus.
+ * Vortex uses "vortex_loopback"; we use "voa_loopback" (register with Nexus staff if missing).
+ * Override with VOA_NEXUS_CLIENT_ID.
+ */
+const NEXUS_OAUTH_BASE = "https://users.nexusmods.com/oauth";
+const NEXUS_OAUTH_CLIENT_ID =
+  process.env.VOA_NEXUS_CLIENT_ID?.trim() || "voa_loopback";
+function nexusAppHeaders(): Record<string, string> {
+  return {
+    "Application-Name": "VisionsOfAetherius",
+    "Application-Version": (() => {
+      try {
+        return app.getVersion() || "0.2.0";
+      } catch {
+        return "0.2.0";
+      }
+    })(),
+    accept: "application/json",
+  };
+}
+
+function base64Url(buf: Buffer): string {
+  return buf
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function pkcePair(): { verifier: string; challenge: string } {
+  const verifier = base64Url(crypto.randomBytes(32));
+  const challenge = base64Url(crypto.createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
+function nexusResultHtml(ok: boolean, detail?: string): string {
+  const title = ok ? "Nexus login successful" : "Nexus login failed";
+  const body = ok
+    ? "You can close this tab and return to Visions of Aetherius."
+    : detail || "Close this tab and try again from the launcher.";
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>${title}</title>
+<style>body{font-family:system-ui,sans-serif;background:#0b0b12;color:#eee;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
+.card{max-width:420px;padding:28px;border-radius:12px;background:#161622;border:1px solid #333}
+h1{font-size:1.25rem;margin:0 0 12px}p{color:#aaa;line-height:1.5}</style></head>
+<body><div class="card"><h1>${title}</h1><p>${body}</p></div></body></html>`;
+}
+
+type NexusTokenReply = {
+  access_token: string;
+  refresh_token?: string;
+  expires_in?: number;
+  token_type?: string;
+};
+
+async function exchangeNexusCode(opts: {
+  code: string;
+  codeVerifier: string;
+  redirectUri: string;
+}): Promise<NexusTokenReply> {
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: NEXUS_OAUTH_CLIENT_ID,
+    redirect_uri: opts.redirectUri,
+    code: opts.code,
+    code_verifier: opts.codeVerifier,
+  });
+  const res = await fetch(`${NEXUS_OAUTH_BASE}/token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      ...nexusAppHeaders(),
+    },
+    body: body.toString(),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    if (/invalid_client/i.test(text)) {
+      throw new Error(
+        `Nexus OAuth client "${NEXUS_OAUTH_CLIENT_ID}" is not registered. Register Visions of Aetherius as a public OAuth app with Nexus Mods (loopback redirects like Vortex), then set VOA_NEXUS_CLIENT_ID if they issue a different id.`
+      );
+    }
+    throw new Error(
+      `Nexus token exchange failed (HTTP ${res.status}): ${text.slice(0, 220)}`
+    );
+  }
+  return JSON.parse(text) as NexusTokenReply;
+}
+
+async function refreshNexusAccessToken(refreshToken: string): Promise<NexusTokenReply> {
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    client_id: NEXUS_OAUTH_CLIENT_ID,
+    refresh_token: refreshToken,
+  });
+  const res = await fetch(`${NEXUS_OAUTH_BASE}/token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      ...nexusAppHeaders(),
+    },
+    body: body.toString(),
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(
+      `Nexus token refresh failed (HTTP ${res.status}): ${text.slice(0, 180)}`
+    );
+  }
+  return JSON.parse(text) as NexusTokenReply;
+}
+
+async function fetchNexusOAuthUser(accessToken: string): Promise<NexusUserInfo> {
+  const res = await fetch(`${NEXUS_OAUTH_BASE}/userinfo`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      ...nexusAppHeaders(),
+    },
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Nexus userinfo failed (HTTP ${res.status}): ${text.slice(0, 160)}`);
+  }
+  let data: any = {};
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error("Invalid Nexus userinfo response");
+  }
+  const roles: string[] = Array.isArray(data.membership_roles)
+    ? data.membership_roles.map(String)
+    : Array.isArray(data.membershipRoles)
+      ? data.membershipRoles.map(String)
+      : [];
+  const isPremium =
+    roles.some((r) => r.toLowerCase() === "premium") ||
+    Boolean(data.is_premium) ||
+    Boolean(data.isPremium);
+  const isSupporter = roles.some((r) => r.toLowerCase() === "supporter");
+  const sub = data.sub ?? data.user_id ?? data.userId;
+  return {
+    userId: sub != null ? Number(sub) || undefined : undefined,
+    name: String(data.name || data.preferred_username || data.username || "Nexus user"),
+    isPremium,
+    isSupporter,
+  };
+}
+
+function saveNexusTokens(token: NexusTokenReply, user: NexusUserInfo): void {
+  const expiresIn = Number(token.expires_in) || 3600;
+  writeStore({
+    nexusAccessToken: token.access_token,
+    nexusRefreshToken: token.refresh_token || readStore().nexusRefreshToken || "",
+    nexusTokenExpiresAt: Date.now() + expiresIn * 1000 - 30_000,
+    nexusUser: user,
+  });
+}
+
+/** Valid OAuth access token for Nexus API (Bearer). Refreshes if needed. */
+async function getValidNexusAccessToken(): Promise<string> {
+  const s = readStore();
+  const access = String(s.nexusAccessToken || "").trim();
+  const refresh = String(s.nexusRefreshToken || "").trim();
+  const exp = s.nexusTokenExpiresAt || 0;
+  if (access && exp > Date.now() + 5_000) return access;
+  if (refresh) {
+    const token = await refreshNexusAccessToken(refresh);
+    const user =
+      s.nexusUser ||
+      (await fetchNexusOAuthUser(token.access_token).catch(() => ({
+        name: "Nexus user",
+        isPremium: false,
+      })));
+    if (!s.nexusUser && token.access_token) {
+      try {
+        const u = await fetchNexusOAuthUser(token.access_token);
+        saveNexusTokens(token, u);
+        return token.access_token;
+      } catch {
+        /* fall through */
+      }
+    }
+    saveNexusTokens(token, user as NexusUserInfo);
+    return token.access_token;
+  }
+  if (access) return access;
+  throw new Error(
+    "Log in to Nexus Mods under Account (browser login). VOA does not use API keys."
+  );
+}
+
+function clearNexusAuthFromDisk(): void {
+  writeStore({
+    nexusAccessToken: "",
+    nexusRefreshToken: "",
+    nexusTokenExpiresAt: 0,
+    nexusUser: null,
+  });
+  try {
+    const p = storePath();
+    if (fs.existsSync(p)) {
+      const raw = JSON.parse(fs.readFileSync(p, "utf8")) as Record<string, unknown>;
+      delete raw.encNexusAccess;
+      delete raw.encNexusRefresh;
+      delete raw.encNexusKey;
+      delete raw.nexusAccessToken;
+      delete raw.nexusRefreshToken;
+      delete raw.nexusApiKey;
+      raw.nexusUser = null;
+      raw.nexusTokenExpiresAt = 0;
+      fs.writeFileSync(p, JSON.stringify(raw, null, 2), "utf8");
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+ipcMain.handle("voa:getNexusAccount", () => {
+  const s = readStore();
+  return {
+    linked: Boolean(s.nexusAccessToken || s.nexusRefreshToken),
+    user: s.nexusUser || null,
+  };
+});
+
+/**
+ * Browser OAuth login (PKCE + 127.0.0.1 loopback), same pattern as Discord / Vortex.
+ * Opens Nexus sign-in page — no personal API key paste.
+ */
+ipcMain.handle("voa:openNexusLogin", async () => {
+  const { verifier, challenge } = pkcePair();
+  const state = crypto.randomBytes(16).toString("hex");
+
+  return await new Promise<{
+    ok: boolean;
+    error?: string;
+    user?: NexusUserInfo;
+  }>((resolve) => {
+    let settled = false;
+    let server: http.Server | null = null;
+    let redirectUri = "";
+
+    const finish = (result: {
+      ok: boolean;
+      error?: string;
+      user?: NexusUserInfo;
+    }) => {
+      if (settled) return;
+      settled = true;
+      try {
+        server?.close();
+      } catch {
+        /* ignore */
+      }
+      resolve(result);
+    };
+
+    const timeout = setTimeout(() => {
+      finish({
+        ok: false,
+        error:
+          "Timed out waiting for Nexus login (5 min). Finish sign-in in the browser, then allow the redirect back to the launcher.",
+      });
+    }, 300_000);
+
+    server = http.createServer(async (req, res) => {
+      try {
+        const u = new URL(req.url || "/", "http://127.0.0.1");
+        const err = u.searchParams.get("error");
+        const code = u.searchParams.get("code");
+        const st = u.searchParams.get("state");
+
+        if (err) {
+          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(nexusResultHtml(false, `Nexus returned: ${err}`));
+          clearTimeout(timeout);
+          finish({ ok: false, error: `Nexus login denied: ${err}` });
+          return;
+        }
+
+        if (!code || !st) {
+          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(nexusResultHtml(false, "Missing code/state from Nexus."));
+          return;
+        }
+        if (st !== state) {
+          res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(nexusResultHtml(false, "Invalid OAuth state."));
+          clearTimeout(timeout);
+          finish({ ok: false, error: "OAuth state mismatch — try login again" });
+          return;
+        }
+
+        try {
+          const token = await exchangeNexusCode({
+            code,
+            codeVerifier: verifier,
+            redirectUri,
+          });
+          const user = await fetchNexusOAuthUser(token.access_token);
+          saveNexusTokens(token, user);
+          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(nexusResultHtml(true));
+          clearTimeout(timeout);
+          finish({ ok: true, user });
+        } catch (e: any) {
+          res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(nexusResultHtml(false, e?.message || String(e)));
+          clearTimeout(timeout);
+          finish({ ok: false, error: e?.message || String(e) });
+        }
+      } catch (e: any) {
+        try {
+          res.writeHead(500, { "Content-Type": "text/html; charset=utf-8" });
+          res.end(nexusResultHtml(false, e?.message || String(e)));
+        } catch {
+          /* ignore */
+        }
+        clearTimeout(timeout);
+        finish({ ok: false, error: e?.message || String(e) });
+      }
+    });
+
+    server.listen(0, "127.0.0.1", async () => {
+      const addr = server!.address();
+      if (!addr || typeof addr === "string") {
+        clearTimeout(timeout);
+        finish({ ok: false, error: "Could not start Nexus login callback server" });
+        return;
+      }
+      // Vortex-style: http://127.0.0.1:PORT (no path) — Nexus must whitelist this client id
+      redirectUri = `http://127.0.0.1:${addr.port}`;
+      const params = new URLSearchParams({
+        response_type: "code",
+        scope: "openid profile email",
+        code_challenge_method: "S256",
+        client_id: NEXUS_OAUTH_CLIENT_ID,
+        redirect_uri: redirectUri,
+        state,
+        code_challenge: challenge,
+      });
+      const authorizeUrl = `${NEXUS_OAUTH_BASE}/authorize?${params.toString()}`;
+      try {
+        await shell.openExternal(authorizeUrl);
+      } catch (e: any) {
+        clearTimeout(timeout);
+        finish({
+          ok: false,
+          error: e?.message || "Could not open browser for Nexus login",
+        });
+      }
+    });
+
+    server.on("error", (e) => {
+      clearTimeout(timeout);
+      finish({ ok: false, error: e.message || "Nexus callback server error" });
+    });
+  });
+});
+
+ipcMain.handle("voa:unlinkNexusAccount", () => {
+  clearNexusAuthFromDisk();
+  return { ok: true };
+});
+
+ipcMain.handle("voa:openExternal", async (_e, url: string) => {
+  const u = String(url || "");
+  if (!/^https?:\/\//i.test(u)) return false;
+  await shell.openExternal(u);
+  return true;
+});
+
 function cmpSemver(a: string, b: string): number {
   const pa = String(a || "0")
     .replace(/^v/i, "")
@@ -652,6 +1865,7 @@ type LauncherUpdateInfo = {
   notes?: string;
   minVersion?: string;
   channel?: string;
+  format?: "portable" | "zip";
 };
 
 function emitLauncherUpdateProgress(payload: {
@@ -711,13 +1925,17 @@ ipcMain.handle("voa:checkLauncherUpdate", async () => {
   }
 });
 
-/** Download portable launcher and swap via helper bat, then quit. */
+type LauncherUpdateInfoExt = LauncherUpdateInfo & {
+  format?: "portable" | "zip";
+};
+
+/** Download launcher update (zip full app or portable exe) and swap via helper bat, then quit. */
 ipcMain.handle("voa:applyLauncherUpdate", async () => {
   try {
     if (!(await ensureApiRunning())) {
       return { ok: false, error: "Cannot reach update server" };
     }
-    const res = await apiRequest<LauncherUpdateInfo>(
+    const res = await apiRequest<LauncherUpdateInfoExt>(
       "GET",
       "/v1/updates/launcher/latest"
     );
@@ -730,10 +1948,17 @@ ipcMain.handle("voa:applyLauncherUpdate", async () => {
       return { ok: false, error: "Already up to date" };
     }
 
+    const isZip =
+      latest.format === "zip" ||
+      /\.zip(\?|$)/i.test(latest.downloadUrl);
+
     const tmpDir = path.join(app.getPath("temp"), "voa-launcher-update");
     fs.mkdirSync(tmpDir, { recursive: true });
-    const tmpExe = path.join(tmpDir, "VisionsOfAetherius-update.exe");
-    if (fs.existsSync(tmpExe)) fs.unlinkSync(tmpExe);
+    const tmpFile = path.join(
+      tmpDir,
+      isZip ? "VisionsOfAetherius-update.zip" : "VisionsOfAetherius-update.exe"
+    );
+    if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
 
     emitLauncherUpdateProgress({
       phase: "download",
@@ -743,10 +1968,9 @@ ipcMain.handle("voa:applyLauncherUpdate", async () => {
       message: `Downloading launcher v${latest.version}…`,
     });
 
-    // Reuse mod download helper (progress re-tagged below via packageId)
     const { size, sha256 } = await downloadFile(
       latest.downloadUrl,
-      tmpExe,
+      tmpFile,
       "__launcher__",
       latest.size
     );
@@ -757,7 +1981,7 @@ ipcMain.handle("voa:applyLauncherUpdate", async () => {
         error: `Update checksum mismatch (got ${sha256.slice(0, 12)}…)`,
       };
     }
-    if (size < 1_000_000) {
+    if (size < 500_000) {
       return { ok: false, error: "Downloaded update looks too small — aborted" };
     }
 
@@ -769,27 +1993,61 @@ ipcMain.handle("voa:applyLauncherUpdate", async () => {
       message: "Installing update…",
     });
 
-    const target = process.execPath;
+    const targetExe = process.execPath;
+    const installDir = path.dirname(targetExe);
     const batPath = path.join(tmpDir, "apply-update.bat");
-    // Escape for batch: wrap paths in quotes; use delayed retry while exe unlocks
-    const bat = [
-      "@echo off",
-      "setlocal",
-      `set "SRC=${tmpExe.replace(/"/g, "")}"`,
-      `set "TARGET=${target.replace(/"/g, "")}"`,
-      "echo Updating Visions of Aetherius Launcher...",
-      "timeout /t 2 /nobreak >nul",
-      ":retry",
-      'copy /y "%SRC%" "%TARGET%" >nul 2>&1',
-      "if errorlevel 1 (",
-      "  timeout /t 1 /nobreak >nul",
-      "  goto retry",
-      ")",
-      'start "" "%TARGET%"',
-      'del "%SRC%" >nul 2>&1',
-      'del "%~f0" >nul 2>&1',
-      "",
-    ].join("\r\n");
+    const src = tmpFile.replace(/"/g, "");
+    const destDir = installDir.replace(/"/g, "");
+    const destExe = targetExe.replace(/"/g, "");
+
+    // Zip = full UI/asar package; portable = single-file replace
+    const bat = isZip
+      ? [
+          "@echo off",
+          "setlocal",
+          `set "SRC=${src}"`,
+          `set "DEST=${destDir}"`,
+          `set "EXE=${destExe}"`,
+          `set "EXTRACT=%TEMP%\\voa-lu-extract-%RANDOM%"`,
+          "echo Updating Visions of Aetherius Launcher (full package)...",
+          "timeout /t 2 /nobreak >nul",
+          'if exist "%EXTRACT%" rmdir /s /q "%EXTRACT%"',
+          'mkdir "%EXTRACT%"',
+          'powershell -NoProfile -Command "Expand-Archive -LiteralPath \'%SRC%\' -DestinationPath \'%EXTRACT%\' -Force"',
+          "if errorlevel 1 (",
+          "  echo Extract failed",
+          "  exit /b 1",
+          ")",
+          ":retry",
+          'xcopy /E /Y /I /Q "%EXTRACT%\\*" "%DEST%\\" >nul',
+          "if errorlevel 1 (",
+          "  timeout /t 1 /nobreak >nul",
+          "  goto retry",
+          ")",
+          'start "" "%EXE%"',
+          'rmdir /s /q "%EXTRACT%" >nul 2>&1',
+          'del "%SRC%" >nul 2>&1',
+          'del "%~f0" >nul 2>&1',
+          "",
+        ].join("\r\n")
+      : [
+          "@echo off",
+          "setlocal",
+          `set "SRC=${src}"`,
+          `set "TARGET=${destExe}"`,
+          "echo Updating Visions of Aetherius Launcher...",
+          "timeout /t 2 /nobreak >nul",
+          ":retry",
+          'copy /y "%SRC%" "%TARGET%" >nul 2>&1',
+          "if errorlevel 1 (",
+          "  timeout /t 1 /nobreak >nul",
+          "  goto retry",
+          ")",
+          'start "" "%TARGET%"',
+          'del "%SRC%" >nul 2>&1',
+          'del "%~f0" >nul 2>&1',
+          "",
+        ].join("\r\n");
     fs.writeFileSync(batPath, bat, "utf8");
 
     spawn("cmd.exe", ["/c", batPath], {
@@ -845,15 +2103,97 @@ ipcMain.handle("voa:getNews", async () => {
 
 ipcMain.handle("voa:getStore", () => {
   const s = readStore();
+  const source = s.skyrimPath || detectSkyrimPath();
+  const useInstance = s.useVoaInstance !== false;
+  const instancePath =
+    s.voaInstancePath ||
+    (source ? defaultInstancePath(source, app.getPath("userData")) : null);
   return {
     user: s.user ?? null,
     skyrimPath: s.skyrimPath ?? null,
+    voaInstancePath: instancePath,
+    useVoaInstance: useInstance,
     hasTokens: Boolean(s.accessToken && s.refreshToken),
     accessToken: s.accessToken ?? null,
     refreshToken: s.refreshToken ?? null,
     characterSlot: typeof s.characterSlot === "number" ? s.characterSlot : 0,
+    musicVolume:
+      typeof s.musicVolume === "number"
+        ? Math.max(0, Math.min(100, s.musicVolume))
+        : 40,
+    musicMuted: Boolean(s.musicMuted),
   };
 });
+
+ipcMain.handle("voa:setUseVoaInstance", (_e, enabled: boolean) => {
+  writeStore({ useVoaInstance: Boolean(enabled) });
+  return { ok: true, useVoaInstance: Boolean(enabled) };
+});
+
+ipcMain.handle("voa:rebuildInstance", async () => {
+  try {
+    const res = resolvePlayableSkyrim({ forceRebuild: true });
+    if (!res.ok) return { ok: false, error: res.error };
+    return {
+      ok: true,
+      path: res.path,
+      sourcePath: res.sourcePath,
+      hardlinked: res.hardlinked,
+      copied: res.copied,
+      created: res.created,
+    };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+});
+
+ipcMain.handle("voa:getInstanceInfo", () => {
+  const source = getSourceSkyrimPath();
+  const s = readStore();
+  const useInstance = s.useVoaInstance !== false;
+  const instancePath =
+    s.voaInstancePath ||
+    (source ? defaultInstancePath(source, app.getPath("userData")) : null);
+  let instanceReady = false;
+  if (instancePath) {
+    try {
+      instanceReady =
+        fs.existsSync(path.join(instancePath, "SkyrimSE.exe")) &&
+        fs.existsSync(path.join(instancePath, ".voa-instance.json"));
+    } catch {
+      instanceReady = false;
+    }
+  }
+  return {
+    sourcePath: source,
+    instancePath,
+    useVoaInstance: useInstance,
+    instanceReady,
+  };
+});
+
+ipcMain.handle(
+  "voa:setMusicPrefs",
+  (
+    _e,
+    prefs: { volume?: number; muted?: boolean }
+  ): { ok: boolean; musicVolume: number; musicMuted: boolean } => {
+    const s = readStore();
+    let volume =
+      typeof s.musicVolume === "number"
+        ? Math.max(0, Math.min(100, s.musicVolume))
+        : 40;
+    let muted = Boolean(s.musicMuted);
+    if (typeof prefs?.volume === "number" && Number.isFinite(prefs.volume)) {
+      volume = Math.max(0, Math.min(100, Math.round(prefs.volume)));
+    }
+    if (typeof prefs?.muted === "boolean") {
+      muted = prefs.muted;
+    }
+    writeStore({ musicVolume: volume, musicMuted: muted });
+    return { ok: true, musicVolume: volume, musicMuted: muted };
+  }
+);
 
 ipcMain.handle("voa:setCharacterSlot", (_e, slot: number) => {
   const n = Number(slot);
@@ -962,6 +2302,440 @@ ipcMain.handle("voa:deleteCharacter", async (_e, characterId: number) => {
     return { ok: false, error: e?.message || String(e) };
   }
 });
+
+ipcMain.handle("voa:getBugReports", async (_e, opts?: { all?: boolean; status?: string }) => {
+  try {
+    const store = readStore();
+    if (!store.accessToken) {
+      return { error: "Not logged in", reports: [], admin: false };
+    }
+    const params = new URLSearchParams();
+    if (opts?.all) params.set("all", "1");
+    if (opts?.status) params.set("status", opts.status);
+    const qs = params.toString() ? `?${params}` : "";
+    const res = await apiRequest<{
+      reports?: unknown[];
+      admin?: boolean;
+      staffRoles?: string[];
+      categories?: string[];
+    }>("GET", `/v1/bug-reports${qs}`, { token: store.accessToken });
+    if (!res.ok) {
+      return {
+        error: (res.data as any)?.error || res.raw || "bug reports failed",
+        reports: [],
+        admin: false,
+      };
+    }
+    return {
+      reports: (res.data as any)?.reports ?? [],
+      admin: Boolean((res.data as any)?.admin),
+      staffRoles: (res.data as any)?.staffRoles ?? [],
+      categories: (res.data as any)?.categories ?? [],
+    };
+  } catch (e: any) {
+    return { error: e?.message || String(e), reports: [], admin: false };
+  }
+});
+
+ipcMain.handle("voa:getStaffInfo", async () => {
+  try {
+    const store = readStore();
+    if (!store.accessToken) {
+      return { isStaff: false, roleLabels: [] as string[] };
+    }
+    const res = await apiRequest<{
+      staff?: { isStaff?: boolean; roleLabels?: string[]; roleIds?: string[] };
+    }>("GET", "/v1/me", { token: store.accessToken });
+    if (!res.ok) return { isStaff: false, roleLabels: [] as string[] };
+    const s = (res.data as any)?.staff;
+    return {
+      isStaff: Boolean(s?.isStaff),
+      roleLabels: Array.isArray(s?.roleLabels) ? s.roleLabels : [],
+      roleIds: Array.isArray(s?.roleIds) ? s.roleIds : [],
+    };
+  } catch {
+    return { isStaff: false, roleLabels: [] as string[] };
+  }
+});
+
+ipcMain.handle("voa:getAdminSummary", async () => {
+  try {
+    const store = readStore();
+    if (!store.accessToken) return { ok: false, error: "Not logged in" };
+    const res = await apiRequest("GET", "/v1/admin/summary", {
+      token: store.accessToken,
+    });
+    if (!res.ok) {
+      return {
+        ok: false,
+        error: (res.data as any)?.error || res.raw || "admin summary failed",
+      };
+    }
+    return { ok: true, ...(res.data as object) };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+});
+
+ipcMain.handle(
+  "voa:submitBugReport",
+  async (
+    _e,
+    payload: {
+      title: string;
+      body: string;
+      category?: string;
+      characterSlot?: number | null;
+      characterName?: string | null;
+      gameVersion?: string;
+    }
+  ) => {
+    try {
+      const store = readStore();
+      if (!store.accessToken) return { ok: false, error: "Not logged in" };
+      const res = await apiRequest("POST", "/v1/bug-reports", {
+        token: store.accessToken,
+        body: {
+          title: payload.title,
+          body: payload.body,
+          category: payload.category || "other",
+          launcherVersion: app.getVersion(),
+          gameVersion: payload.gameVersion || undefined,
+          characterSlot: payload.characterSlot,
+          characterName: payload.characterName,
+        },
+      });
+      if (!res.ok) {
+        return {
+          ok: false,
+          error: (res.data as any)?.error || res.raw || "submit failed",
+        };
+      }
+      return { ok: true, report: (res.data as any)?.report };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || String(e) };
+    }
+  }
+);
+
+/** Opt-in support log disclaimer (shown in Settings UI). */
+const SUPPORT_LOG_DISCLAIMER = `SUPPORT LOG UPLOAD — PLEASE READ
+
+By uploading, you choose to send diagnostic information to Visions of Aetherius staff so they can help fix crashes, multiplayer, or launcher issues.
+
+What may be included (after automatic redaction):
+• Skyrim Platform / SKSE log tails
+• Launcher play log (paths partially redacted)
+• SkyrimPlatform.ini (non-secret settings)
+• Client/plugin file sizes and versions we already manage
+
+We try to remove Windows usernames, full home paths, tokens, and secrets before upload. Redaction is best-effort — do not paste passwords or personal secrets into the “reason” field.
+
+How we use this:
+• Only to diagnose and fix technical problems you reported or that affect stability
+• Access is limited to authorized staff
+• Files are stored privately (not a public CDN listing) and deleted after about 30 days
+
+This is optional. You can play without uploading logs. Uploading is not required to use VOA.
+
+By checking “I understand and consent” and clicking Upload, you confirm you have read this notice and voluntarily consent to this processing for support purposes.`;
+
+function redactSupportLogText(input: string): string {
+  let s = String(input || "");
+  s = s.replace(/([A-Za-z]:\\Users\\)[^\\\/\s"']+/gi, "$1REDACTED");
+  s = s.replace(/(\/Users\/)[^\/\s"']+/g, "$1REDACTED");
+  s = s.replace(/(\\Users\\)[^\\\/\s"']+/gi, "$1REDACTED");
+  s = s.replace(/(Bearer\s+)[A-Za-z0-9\-._~+\/]+=*/gi, "$1[REDACTED]");
+  s = s.replace(
+    /("?(?:accessToken|refreshToken|session|token|secret|password|authorization)"?\s*[:=]\s*")[^"]*(")/gi,
+    "$1[REDACTED]$2"
+  );
+  s = s.replace(/(session=)[^&\s"']+/gi, "$1[REDACTED]");
+  s = s.replace(/\b[A-Za-z0-9_-]{80,}\b/g, "[REDACTED_TOKEN]");
+  return s;
+}
+
+function collectSupportLogBundle(): { text: string; files: string[] } {
+  const parts: string[] = [];
+  const files: string[] = [];
+  const maxPerFile = 180_000;
+  const pushFile = (label: string, p: string) => {
+    try {
+      if (!p || !fs.existsSync(p)) return;
+      const st = fs.statSync(p);
+      if (!st.isFile() || st.size <= 0) return;
+      let raw = fs.readFileSync(p, "utf8");
+      if (raw.length > maxPerFile) raw = raw.slice(raw.length - maxPerFile);
+      parts.push(`\n\n======== ${label} (${p}) size=${st.size} ========\n`);
+      parts.push(raw);
+      files.push(label);
+    } catch {
+      /* ignore missing */
+    }
+  };
+
+  const docsSkse = path.join(
+    app.getPath("documents"),
+    "My Games",
+    "Skyrim Special Edition",
+    "SKSE"
+  );
+  pushFile("skyrim-platform.log", path.join(docsSkse, "skyrim-platform.log"));
+  pushFile("skse64.log", path.join(docsSkse, "skse64.log"));
+  // Newest skse crash/load logs
+  try {
+    if (fs.existsSync(docsSkse)) {
+      const logs = fs
+        .readdirSync(docsSkse)
+        .filter((n) => /\.log$/i.test(n))
+        .map((n) => ({ n, t: fs.statSync(path.join(docsSkse, n)).mtimeMs }))
+        .sort((a, b) => b.t - a.t)
+        .slice(0, 6);
+      for (const L of logs) {
+        if (L.n === "skyrim-platform.log" || L.n === "skse64.log") continue;
+        pushFile(L.n, path.join(docsSkse, L.n));
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+
+  pushFile(
+    "voa-play.log",
+    path.join(app.getPath("userData"), "voa-play.log")
+  );
+
+  const store = readStore();
+  const roots = [store.voaInstancePath, store.skyrimPath].filter(
+    Boolean
+  ) as string[];
+  for (const root of roots) {
+    pushFile(
+      "SkyrimPlatform.ini",
+      path.join(root, "Data", "SKSE", "Plugins", "SkyrimPlatform.ini")
+    );
+    try {
+      const plugins = path.join(root, "Data", "Platform", "Plugins");
+      if (fs.existsSync(plugins)) {
+        const list = fs
+          .readdirSync(plugins)
+          .map((n) => {
+            try {
+              const st = fs.statSync(path.join(plugins, n));
+              return `${n}\t${st.size}\t${st.mtime.toISOString()}`;
+            } catch {
+              return n;
+            }
+          })
+          .join("\n");
+        parts.push(
+          `\n\n======== Platform/Plugins listing (${root}) ========\n${list}\n`
+        );
+        files.push("Platform/Plugins listing");
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      const client = path.join(
+        root,
+        "Data",
+        "Platform",
+        "Plugins",
+        "skymp5-client.js"
+      );
+      if (fs.existsSync(client)) {
+        const st = fs.statSync(client);
+        parts.push(
+          `\n\n======== skymp5-client.js meta ========\npath=${client}\nsize=${st.size}\nmtime=${st.mtime.toISOString()}\n`
+        );
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  parts.unshift(
+    `VOA support log bundle\ncollectedAt=${new Date().toISOString()}\nlauncher=${app.getVersion()}\napi=${API_BASE}\nplatform=${process.platform}\narch=${process.arch}\n`
+  );
+
+  let text = redactSupportLogText(parts.join(""));
+  const maxTotal = 500_000;
+  if (text.length > maxTotal) text = text.slice(text.length - maxTotal);
+  return { text, files: [...new Set(files)] };
+}
+
+ipcMain.handle("voa:getSupportLogDisclaimer", () => ({
+  disclaimer: SUPPORT_LOG_DISCLAIMER,
+  retentionDays: 30,
+  maxBytes: 512 * 1024,
+}));
+
+ipcMain.handle(
+  "voa:uploadSupportLogs",
+  async (
+    _e,
+    payload: { consent?: boolean; reason?: string }
+  ) => {
+    try {
+      if (payload?.consent !== true) {
+        return {
+          ok: false,
+          error: "Consent required. Check the disclaimer box first.",
+        };
+      }
+      const store = readStore();
+      if (!store.accessToken) {
+        return { ok: false, error: "Log in with Discord first." };
+      }
+      const bundle = collectSupportLogBundle();
+      if (!bundle.text || bundle.text.length < 40) {
+        return {
+          ok: false,
+          error: "No log files found. Play once or open the game so logs exist.",
+        };
+      }
+      const res = await apiRequest("POST", "/v1/support/logs", {
+        token: store.accessToken,
+        body: {
+          consent: true,
+          consentText: "user_checked_disclaimer_and_consented",
+          reason: String(payload.reason || "").slice(0, 200),
+          launcherVersion: app.getVersion(),
+          text: bundle.text,
+        },
+      });
+      if (!res.ok) {
+        return {
+          ok: false,
+          error: (res.data as any)?.error || res.raw || "upload failed",
+        };
+      }
+      const data = res.data as any;
+      return {
+        ok: true,
+        id: data?.id,
+        sizeBytes: data?.sizeBytes,
+        expiresAt: data?.expiresAt,
+        files: bundle.files,
+        message: data?.message,
+      };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || String(e) };
+    }
+  }
+);
+
+ipcMain.handle(
+  "voa:updateBugReport",
+  async (
+    _e,
+    payload: { id: number; status: string; staffNote?: string | null }
+  ) => {
+    try {
+      const store = readStore();
+      if (!store.accessToken) return { ok: false, error: "Not logged in" };
+      const res = await apiRequest("PATCH", `/v1/bug-reports/${Number(payload.id)}`, {
+        token: store.accessToken,
+        body: {
+          status: payload.status,
+          staffNote: payload.staffNote,
+        },
+      });
+      if (!res.ok) {
+        return {
+          ok: false,
+          error: (res.data as any)?.error || res.raw || "update failed",
+        };
+      }
+      return { ok: true, report: (res.data as any)?.report };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || String(e) };
+    }
+  }
+);
+
+ipcMain.handle("voa:deleteBugReport", async (_e, id: number) => {
+  try {
+    const store = readStore();
+    if (!store.accessToken) return { ok: false, error: "Not logged in" };
+    const res = await apiRequest("DELETE", `/v1/bug-reports/${Number(id)}`, {
+      token: store.accessToken,
+    });
+    if (!res.ok) {
+      return {
+        ok: false,
+        error: (res.data as any)?.error || res.raw || "delete failed",
+      };
+    }
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+});
+
+ipcMain.handle(
+  "voa:getAdminCharacters",
+  async (_e, opts?: { q?: string; includeEmpty?: boolean }) => {
+    try {
+      const store = readStore();
+      if (!store.accessToken) {
+        return { ok: false, error: "Not logged in", characters: [] };
+      }
+      const params = new URLSearchParams();
+      if (opts?.q) params.set("q", opts.q);
+      if (opts?.includeEmpty) params.set("includeEmpty", "1");
+      const qs = params.toString() ? `?${params}` : "";
+      const res = await apiRequest("GET", `/v1/admin/characters${qs}`, {
+        token: store.accessToken,
+      });
+      if (!res.ok) {
+        return {
+          ok: false,
+          error: (res.data as any)?.error || res.raw || "list failed",
+          characters: [],
+        };
+      }
+      return {
+        ok: true,
+        characters: (res.data as any)?.characters ?? [],
+        actions: (res.data as any)?.actions ?? [],
+      };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || String(e), characters: [] };
+    }
+  }
+);
+
+ipcMain.handle(
+  "voa:adminCharacterAction",
+  async (
+    _e,
+    payload: { characterId: number; action: string; note?: string }
+  ) => {
+    try {
+      const store = readStore();
+      if (!store.accessToken) return { ok: false, error: "Not logged in" };
+      const res = await apiRequest(
+        "POST",
+        `/v1/admin/characters/${Number(payload.characterId)}/action`,
+        {
+          token: store.accessToken,
+          body: { action: payload.action, note: payload.note },
+        }
+      );
+      if (!res.ok) {
+        return {
+          ok: false,
+          error: (res.data as any)?.error || res.raw || "action failed",
+        };
+      }
+      return { ok: true, ...(res.data as object) };
+    } catch (e: any) {
+      return { ok: false, error: e?.message || String(e) };
+    }
+  }
+);
 
 ipcMain.handle("voa:setAuth", (_e, payload: { accessToken: string; refreshToken: string; user: unknown }) => {
   writeStore({
@@ -1102,7 +2876,7 @@ ipcMain.handle("voa:openDiscordLogin", async () => {
 
 ipcMain.handle("voa:pickSkyrimPath", async () => {
   const res = await dialog.showOpenDialog({
-    title: "Select Skyrim Special Edition folder",
+    title: "Select your Skyrim Special Edition folder",
     properties: ["openDirectory"],
   });
   if (res.canceled || !res.filePaths[0]) return null;
@@ -1110,7 +2884,11 @@ ipcMain.handle("voa:pickSkyrimPath", async () => {
   if (!fs.existsSync(path.join(dir, "SkyrimSE.exe")) && !fs.existsSync(path.join(dir, "skse64_loader.exe"))) {
     return { error: "Folder does not look like Skyrim SE" };
   }
-  writeStore({ skyrimPath: dir });
+  // Source only — instance path is derived next Play (or Rebuild)
+  writeStore({
+    skyrimPath: dir,
+    voaInstancePath: defaultInstancePath(dir, app.getPath("userData")),
+  });
   return { path: dir };
 });
 
@@ -1131,15 +2909,27 @@ ipcMain.handle("voa:play", async (_e, opts?: { characterSlot?: number }) => {
     }
 
     const store = readStore();
-    const skyrim = store.skyrimPath || detectSkyrimPath();
-    if (!skyrim) return { ok: false, error: "Skyrim path not set" };
     if (!store.accessToken || !store.refreshToken) {
       return { ok: false, error: "Not logged in — use Login with Discord first" };
     }
 
-    const clientInstall = ensureClientPlugin(skyrim);
+    // Dedicated VOA game folder (default) — never writes into the main Skyrim install
+    const playRoot = resolvePlayableSkyrim();
+    if (!playRoot.ok || !playRoot.path) {
+      return { ok: false, error: playRoot.error || "VOA game folder not ready" };
+    }
+    const skyrim = playRoot.path;
+    playLog(
+      `play root=${skyrim} instance=${Boolean(playRoot.usingInstance)} source=${playRoot.sourcePath || "?"}`
+    );
+
+    // Always pull authoritative client + password from VPS API (matches ClientVerify)
+    const clientInstall = await installVoaGameFiles(skyrim);
     if (!clientInstall.ok) {
-      return { ok: false, error: clientInstall.error || "Failed to install multiplayer client" };
+      return {
+        ok: false,
+        error: clientInstall.error || "Failed to install multiplayer client files",
+      };
     }
 
     const characterSlot =
@@ -1264,38 +3054,127 @@ ipcMain.handle("voa:play", async (_e, opts?: { characterSlot?: number }) => {
       }
     }
 
+    // Always rewrite clean settings pointing at the official VOA server.
+    // offlineMode server uses profileId; session is included for master compatibility.
+    const serverIp = session.serverIp || PUBLIC_GAME.ip;
+    const serverPort = Number(session.serverPort) || PUBLIC_GAME.port;
+    const profileId = Number(session.profileId);
+    if (!Number.isFinite(profileId)) {
+      return {
+        ok: false,
+        error:
+          "Session did not return a valid profileId. Log out, Discord Login again, then Play.",
+      };
+    }
     const next = {
-      ...existing,
-      "server-ip": session.serverIp,
-      "server-port": session.serverPort,
-      master: session.master,
+      "server-ip": serverIp,
+      "server-port": serverPort,
+      master: String(session.master || API_BASE).replace(/\/$/, ""),
       gameData: {
-        profileId: session.profileId,
-        session: session.session,
-        characterSlot: session.characterSlot ?? characterSlot,
+        profileId,
+        session: String(session.session || ""),
+        characterSlot: Number(session.characterSlot ?? characterSlot) || 0,
       },
     };
-    delete (next as { "server-master-key"?: string })["server-master-key"];
 
-    fs.writeFileSync(settingsPath, JSON.stringify(next, null, 2), "utf8");
+    // No BOM — Skyrim Platform JSON settings parse is picky; exclusive write breaks hardlinks
+    writeFileExclusive(settingsPath, JSON.stringify(next, null, 2) + "\n", "utf8");
+    playLog(
+      `settings written ${settingsPath} ip=${serverIp} port=${serverPort} profileId=${profileId} client=${clientInstall.source}/${clientInstall.clientBytes}`
+    );
+
+    // Re-assert password after settings write
+    try {
+      const distDir = path.join(skyrim, "Data", "Platform", "Distribution");
+      fs.mkdirSync(distDir, { recursive: true });
+      writeFileExclusive(path.join(distDir, "password"), "2", "utf8");
+    } catch {
+      /* ignore */
+    }
 
     const loader = path.join(skyrim, "skse64_loader.exe");
     if (!fs.existsSync(loader)) {
-      return { ok: false, error: `skse64_loader.exe not found in ${skyrim}` };
+      return {
+        ok: false,
+        error: `skse64_loader.exe not found in ${skyrim}. Install SKSE64 AE 2.2.6 from the Mods tab.`,
+      };
     }
 
-    spawn(loader, [], {
-      cwd: skyrim,
-      detached: true,
-      stdio: "ignore",
-    }).unref();
+    // Hard requirements for multiplayer (SKSE plugins)
+    const spDll = path.join(skyrim, "Data", "SKSE", "Plugins", "SkyrimPlatform.dll");
+    const mpDll = path.join(skyrim, "Data", "SKSE", "Plugins", "MpClientPlugin.dll");
+    const spImpl = path.join(
+      skyrim,
+      "Data",
+      "Platform",
+      "Distribution",
+      "RuntimeDependencies",
+      "SkyrimPlatformImpl.dll"
+    );
+    if (!fs.existsSync(spDll) || !fs.existsSync(spImpl)) {
+      return {
+        ok: false,
+        error:
+          "Skyrim Platform is not installed correctly (missing SkyrimPlatform.dll / SkyrimPlatformImpl.dll). Install SP 2.9 for AE 1.6.1170, then Play again.",
+      };
+    }
+    if (!fs.existsSync(mpDll)) {
+      return {
+        ok: false,
+        error:
+          "MpClientPlugin.dll is missing under Data\\SKSE\\Plugins. Install the VOA multiplayer core / Skyrim Platform package.",
+      };
+    }
+
+    // Help SKSE/Steam when launching outside Steam UI
+    try {
+      writeFileExclusive(path.join(skyrim, "steam_appid.txt"), "489830", "utf8");
+    } catch {
+      /* ignore */
+    }
+
+    // Prefer skse64_loader (SKSE injects); never launch bare SkyrimSE.exe for MP.
+    const al1170 = path.join(skyrim, "Data", "SKSE", "Plugins", "versionlib-1-6-1170-0.bin");
+    if (!fs.existsSync(al1170)) {
+      return {
+        ok: false,
+        error:
+          "Address Library for SKSE is missing versionlib-1-6-1170-0.bin (required for game 1.6.1170). Install Address Library All in One from the Mods tab / Nexus, then Play again.",
+      };
+    }
+
+    // SP loads every file under Plugins (except *-settings.txt); keep PluginsDev present
+    // so DirectoryMonitor does not spam "code 2".
+    try {
+      fs.mkdirSync(path.join(skyrim, "Data", "Platform", "PluginsDev"), {
+        recursive: true,
+      });
+    } catch {
+      /* ignore */
+    }
+
+    // Launch SKSE → game (writes session/settings above so client joins VPS).
+    const launched = await launchSkseMultiplayer(skyrim, loader);
+    if (!launched.ok) {
+      return { ok: false, error: launched.error || "Failed to start SKSE" };
+    }
 
     return {
       ok: true,
       settingsPath,
-      profileId: session.profileId,
-      serverIp: session.serverIp,
-      serverPort: session.serverPort,
+      profileId,
+      serverIp,
+      serverPort,
+      clientSource: clientInstall.source,
+      clientBytes: clientInstall.clientBytes,
+      launchMethod: launched.method,
+      cleanedPlugins: clientInstall.cleanedPlugins || [],
+      playPath: skyrim,
+      sourcePath: playRoot.sourcePath,
+      usingInstance: Boolean(playRoot.usingInstance),
+      instanceCreated: Boolean(playRoot.created),
+      mpHint:
+        "In-game: open the Skyrim Platform console (bottom of screen). You should see: Hello Multiplayer → Connecting → Logging in. Multiplayer files live in the VOA game folder so your main Skyrim install stays clean.",
     };
   } catch (e: any) {
     return { ok: false, error: e?.message || String(e) };
@@ -1329,7 +3208,106 @@ type CatalogPackage = {
   required?: boolean;
   tags?: string[];
   available?: boolean;
+  source?: "local" | "nexus";
+  nexusGame?: string;
+  nexusModId?: number;
+  nexusFileId?: number;
+  remapSkseToData?: boolean;
 };
+
+type NexusDownloadLink = {
+  URI: string;
+  name?: string;
+  short_name?: string;
+};
+
+/**
+ * Resolve a short-lived Nexus CDN URL using the player's OAuth access token.
+ * Free vs Premium follows the logged-in Nexus account (Bearer), not a VOA key.
+ * Premium gets direct download_link; Free may be limited by Nexus policy.
+ */
+async function getNexusDownloadUriWithOAuth(
+  accessToken: string,
+  gameDomain: string,
+  modId: number,
+  fileId: number
+): Promise<string> {
+  const url = `https://api.nexusmods.com/v1/games/${encodeURIComponent(
+    gameDomain
+  )}/mods/${modId}/files/${fileId}/download_link.json`;
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Application-Name": "VisionsOfAetherius",
+      "Application-Version": app.getVersion() || "0.2.0",
+      accept: "application/json",
+    },
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
+      throw new Error(
+        "Nexus rejected your session. Log in again under Account → Nexus Mods."
+      );
+    }
+    if (res.status === 429) {
+      throw new Error(
+        "Nexus rate limit reached. Free accounts have download limits — wait a bit or use Premium, then try again."
+      );
+    }
+    throw new Error(
+      `Nexus download_link failed (HTTP ${res.status}): ${text.slice(0, 180)}`
+    );
+  }
+  let links: NexusDownloadLink[] = [];
+  try {
+    links = JSON.parse(text) as NexusDownloadLink[];
+  } catch {
+    throw new Error("Invalid response from Nexus download_link API");
+  }
+  if (!Array.isArray(links) || !links.length || !links[0]?.URI) {
+    throw new Error(
+      "Nexus returned no download links. Premium accounts get direct downloads; Free may need to open the mod page on nexusmods.com once, or upgrade."
+    );
+  }
+  const raw = links[0].URI;
+  try {
+    const u = new URL(raw);
+    u.pathname = u.pathname
+      .split("/")
+      .map((p) => encodeURIComponent(decodeURIComponent(p)))
+      .join("/");
+    return u.toString();
+  } catch {
+    return raw.replace(/ /g, "%20");
+  }
+}
+
+/** Map Address Library-style SKSE/ roots to Data/SKSE/ under the game install. */
+function remapNexusInstallRel(rel: string, remapSkseToData: boolean): string {
+  if (!remapSkseToData) return rel;
+  const parts = rel.replace(/\\/g, "/").split("/").filter(Boolean);
+  if (!parts.length) return rel;
+  const first = parts[0].toLowerCase();
+  if (first === "skse") {
+    return path.join("Data", ...parts);
+  }
+  if (
+    first === "data" &&
+    parts.length >= 2 &&
+    parts[1].toLowerCase() === "skse"
+  ) {
+    return path.join(...parts);
+  }
+  // Bare .bin versionlib files → Data/SKSE/Plugins/
+  if (
+    parts.length === 1 &&
+    parts[0].toLowerCase().endsWith(".bin")
+  ) {
+    return path.join("Data", "SKSE", "Plugins", parts[0]);
+  }
+  return rel;
+}
 
 const activeDownloads = new Set<string>();
 
@@ -1521,6 +3499,13 @@ function listFilesRecursive(dir: string, base = dir): string[] {
 
 function copyFileEnsuringDir(src: string, dest: string): void {
   fs.mkdirSync(path.dirname(dest), { recursive: true });
+  // Break hardlinks so mod installs never mutate the main Skyrim install
+  try {
+    const st = fs.lstatSync(dest);
+    if (st.isFile() && st.nlink > 1) fs.unlinkSync(dest);
+  } catch {
+    /* missing ok */
+  }
   fs.copyFileSync(src, dest);
 }
 
@@ -1578,12 +3563,16 @@ ipcMain.handle(
     }
 
     const store = readStore();
-    const skyrim = store.skyrimPath || detectSkyrimPath();
-    if (!skyrim) {
-      return { ok: false, error: "Set your Skyrim SE folder in Settings first" };
+    const playRoot = resolvePlayableSkyrim();
+    if (!playRoot.ok || !playRoot.path) {
+      return {
+        ok: false,
+        error: playRoot.error || "Set your base Skyrim folder in Settings first",
+      };
     }
+    const skyrim = playRoot.path;
     if (!fs.existsSync(path.join(skyrim, "SkyrimSE.exe"))) {
-      return { ok: false, error: "Skyrim path looks invalid (SkyrimSE.exe missing)" };
+      return { ok: false, error: "VOA game folder looks invalid (SkyrimSE.exe missing)" };
     }
 
     activeDownloads.add(packageId);
@@ -1596,54 +3585,144 @@ ipcMain.handle(
         throw new Error(`Cannot reach API at ${API_BASE}`);
       }
 
-      // Fetch catalog entry for URL / size / hash
+      // Fetch catalog entry for URL / size / hash / nexus metadata
       const catRes = await apiRequest<{ packages: CatalogPackage[] }>("GET", "/v1/mods");
       if (!catRes.ok) throw new Error(catRes.raw || "Failed to load mod catalog");
       const pkg = (catRes.data?.packages || []).find((p) => p.id === packageId);
       if (!pkg) throw new Error("Package not found in catalog");
-      if (pkg.available === false) throw new Error("Package archive is not available on the server");
+
+      // Known Nexus packages (fallback if older API catalog omits ids)
+      const NEXUS_FALLBACKS: Record<
+        string,
+        {
+          nexusGame: string;
+          nexusModId: number;
+          nexusFileId: number;
+          remapSkseToData: boolean;
+        }
+      > = {
+        "address-library-ae": {
+          nexusGame: "skyrimspecialedition",
+          nexusModId: 32444,
+          nexusFileId: 720756,
+          remapSkseToData: true,
+        },
+      };
+      const nexusFallback = NEXUS_FALLBACKS[packageId];
+      const nexusGame = pkg.nexusGame || nexusFallback?.nexusGame;
+      const nexusModId = pkg.nexusModId || nexusFallback?.nexusModId;
+      const nexusFileId = pkg.nexusFileId || nexusFallback?.nexusFileId;
+      const remapSkse =
+        Boolean(pkg.remapSkseToData) ||
+        Boolean(nexusFallback?.remapSkseToData);
+      const isNexus =
+        pkg.source === "nexus" ||
+        Boolean(nexusModId && nexusFileId && nexusGame) ||
+        Boolean(nexusFallback);
+
+      // Local packages need the VOA archive; Nexus packages need the user's key only.
+      if (pkg.available === false && !isNexus) {
+        throw new Error("Package archive is not available on the server");
+      }
 
       fs.rmSync(tmpRoot, { recursive: true, force: true });
       fs.mkdirSync(tmpRoot, { recursive: true });
 
-      emitModProgress({
-        packageId,
-        phase: "download",
-        received: 0,
-        total: pkg.size || 0,
-        percent: 0,
-        message: "Starting download…",
-      });
+      let size = 0;
+      let sha256 = "";
 
-      const { size, sha256 } = await downloadFile(
-        pkg.downloadUrl,
-        zipPath,
-        packageId,
-        pkg.size
-      );
+      if (isNexus) {
+        // User OAuth session — Free/Premium from their Nexus browser login.
+        if (!nexusGame || !nexusModId || !nexusFileId) {
+          throw new Error("Catalog is missing Nexus file ids for this package");
+        }
 
-      if (pkg.sha256 && sha256.toLowerCase() !== pkg.sha256.toLowerCase()) {
         emitModProgress({
           packageId,
-          phase: "error",
-          received: size,
-          total: pkg.size || size,
+          phase: "download",
+          received: 0,
+          total: pkg.size || 0,
           percent: 0,
-          message: "Checksum mismatch",
+          message: store.nexusUser?.isPremium
+            ? "Requesting Nexus Premium download link…"
+            : "Requesting Nexus download link (Free account)…",
         });
-        throw new Error(
-          `Package checksum mismatch (expected ${pkg.sha256.slice(0, 12)}…, got ${sha256.slice(0, 12)}…)`
-        );
-      }
 
-      emitModProgress({
-        packageId,
-        phase: "verify",
-        received: size,
-        total: size,
-        percent: 100,
-        message: "Verified package integrity",
-      });
+        const accessToken = await getValidNexusAccessToken();
+        const cdnUri = await getNexusDownloadUriWithOAuth(
+          accessToken,
+          nexusGame,
+          nexusModId,
+          nexusFileId
+        );
+
+        emitModProgress({
+          packageId,
+          phase: "download",
+          received: 0,
+          total: pkg.size || 0,
+          percent: 0,
+          message: "Downloading from Nexus CDN…",
+        });
+
+        const dl = await downloadFile(cdnUri, zipPath, packageId, pkg.size);
+        size = dl.size;
+        sha256 = dl.sha256;
+
+        emitModProgress({
+          packageId,
+          phase: "verify",
+          received: size,
+          total: size,
+          percent: 100,
+          message: "Downloaded from Nexus (checksum skipped)",
+        });
+      } else {
+        if (!pkg.downloadUrl) {
+          throw new Error("Package has no download URL");
+        }
+
+        emitModProgress({
+          packageId,
+          phase: "download",
+          received: 0,
+          total: pkg.size || 0,
+          percent: 0,
+          message: "Starting download…",
+        });
+
+        const dl = await downloadFile(
+          pkg.downloadUrl,
+          zipPath,
+          packageId,
+          pkg.size
+        );
+        size = dl.size;
+        sha256 = dl.sha256;
+
+        if (pkg.sha256 && sha256.toLowerCase() !== pkg.sha256.toLowerCase()) {
+          emitModProgress({
+            packageId,
+            phase: "error",
+            received: size,
+            total: pkg.size || size,
+            percent: 0,
+            message: "Checksum mismatch",
+          });
+          throw new Error(
+            `Package checksum mismatch (expected ${pkg.sha256.slice(0, 12)}…, got ${sha256.slice(0, 12)}…)`
+          );
+        }
+
+        emitModProgress({
+          packageId,
+          phase: "verify",
+          received: size,
+          total: size,
+          percent: 100,
+          message: "Verified package integrity",
+        });
+      }
 
       emitModProgress({
         packageId,
@@ -1693,6 +3772,8 @@ ipcMain.handle(
           path.basename(rel).toLowerCase() === "voa-package.json"
         ) {
           destRel = path.join("Data", "VOA", "Packages", packageId, "VOA_PACKAGE.json");
+        } else if (isNexus) {
+          destRel = remapNexusInstallRel(rel, remapSkse);
         }
         // Normalize to forward-slash storage, Windows path ops use path.join
         const destAbs = path.join(skyrim, destRel);
@@ -1742,6 +3823,27 @@ ipcMain.handle(
   }
 );
 
+function removeTrackedPackageFiles(
+  skyrim: string,
+  rec: InstalledModRecord
+): { removed: number; errors: string[] } {
+  let removed = 0;
+  const errors: string[] = [];
+  for (const rel of rec.files || []) {
+    const abs = path.join(skyrim, rel);
+    try {
+      if (fs.existsSync(abs)) {
+        fs.unlinkSync(abs);
+        removed++;
+      }
+      pruneEmptyDirs(abs, skyrim);
+    } catch (e: any) {
+      errors.push(`${rel}: ${e?.message || e}`);
+    }
+  }
+  return { removed, errors };
+}
+
 ipcMain.handle(
   "voa:uninstallMod",
   async (
@@ -1750,34 +3852,325 @@ ipcMain.handle(
   ): Promise<{ ok: boolean; error?: string; removed?: number }> => {
     if (!packageId) return { ok: false, error: "Invalid package id" };
 
-    const store = readStore();
-    const skyrim = store.skyrimPath || detectSkyrimPath();
-    if (!skyrim) return { ok: false, error: "Skyrim path not set" };
+    const playRoot = resolvePlayableSkyrim();
+    if (!playRoot.ok || !playRoot.path) {
+      return { ok: false, error: playRoot.error || "Skyrim path not set" };
+    }
+    const skyrim = playRoot.path;
 
     const installs = readInstalls();
     const rec = installs.packages[packageId];
     if (!rec) return { ok: false, error: "Package is not installed" };
 
-    let removed = 0;
-    for (const rel of rec.files || []) {
-      const abs = path.join(skyrim, rel);
-      try {
-        if (fs.existsSync(abs)) {
-          fs.unlinkSync(abs);
-          removed++;
-        }
-        pruneEmptyDirs(abs, skyrim);
-      } catch (e: any) {
-        return {
-          ok: false,
-          error: `Failed to remove ${rel}: ${e?.message || e}`,
-        };
-      }
+    const { removed, errors } = removeTrackedPackageFiles(skyrim, rec);
+    if (errors.length) {
+      return {
+        ok: false,
+        error: `Failed to remove some files: ${errors[0]}`,
+        removed,
+      };
     }
 
     delete installs.packages[packageId];
     writeInstalls(installs);
 
     return { ok: true, removed };
+  }
+);
+
+/** Verify tracked mod files under the VOA game folder; report missing paths. */
+ipcMain.handle("voa:verifyMods", async () => {
+  try {
+    const playRoot = resolvePlayableSkyrim();
+    if (!playRoot.ok || !playRoot.path) {
+      return { ok: false, error: playRoot.error || "Skyrim path not set" };
+    }
+    const skyrim = playRoot.path;
+    const installs = readInstalls();
+    const ids = Object.keys(installs.packages);
+    if (!ids.length) {
+      return {
+        ok: true,
+        packagesChecked: 0,
+        packagesOk: 0,
+        packagesBroken: 0,
+        filesChecked: 0,
+        filesMissing: 0,
+        broken: [] as Array<{
+          id: string;
+          name: string;
+          missing: string[];
+          present: number;
+          total: number;
+        }>,
+        message: "No packages installed to verify.",
+      };
+    }
+
+    let filesChecked = 0;
+    let filesMissing = 0;
+    let packagesOk = 0;
+    const broken: Array<{
+      id: string;
+      name: string;
+      missing: string[];
+      present: number;
+      total: number;
+    }> = [];
+
+    for (const id of ids) {
+      const rec = installs.packages[id];
+      const missing: string[] = [];
+      let present = 0;
+      const files = rec.files || [];
+      for (const rel of files) {
+        filesChecked++;
+        const abs = path.join(skyrim, rel);
+        try {
+          if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+            present++;
+          } else {
+            missing.push(rel);
+            filesMissing++;
+          }
+        } catch {
+          missing.push(rel);
+          filesMissing++;
+        }
+      }
+      if (missing.length === 0 && files.length > 0) {
+        packagesOk++;
+      } else if (files.length === 0) {
+        // Empty file list — treat as broken so user can reinstall
+        broken.push({
+          id,
+          name: rec.name || id,
+          missing: ["(no tracked files — reinstall recommended)"],
+          present: 0,
+          total: 0,
+        });
+      } else {
+        broken.push({
+          id,
+          name: rec.name || id,
+          missing,
+          present,
+          total: files.length,
+        });
+      }
+    }
+
+    const packagesBroken = broken.length;
+    const message =
+      packagesBroken === 0
+        ? `All good: ${packagesOk} package(s), ${filesChecked} file(s) present in VOA game folder.`
+        : `Found ${packagesBroken} package(s) with missing files (${filesMissing} missing of ${filesChecked}). Use Download All or reinstall those packages.`;
+
+    playLog(
+      `verifyMods checked=${ids.length} ok=${packagesOk} broken=${packagesBroken} missingFiles=${filesMissing}`
+    );
+
+    return {
+      ok: true,
+      packagesChecked: ids.length,
+      packagesOk,
+      packagesBroken,
+      filesChecked,
+      filesMissing,
+      broken,
+      playPath: skyrim,
+      message,
+    };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+});
+
+/** Remove every tracked VOA mod package from the playable game folder. */
+ipcMain.handle("voa:uninstallAllMods", async () => {
+  try {
+    const playRoot = resolvePlayableSkyrim();
+    if (!playRoot.ok || !playRoot.path) {
+      return { ok: false, error: playRoot.error || "Skyrim path not set" };
+    }
+    const skyrim = playRoot.path;
+    const installs = readInstalls();
+    const ids = Object.keys(installs.packages);
+    if (!ids.length) {
+      return {
+        ok: true,
+        packagesRemoved: 0,
+        filesRemoved: 0,
+        message: "No VOA packages were installed.",
+      };
+    }
+
+    let filesRemoved = 0;
+    const packageErrors: string[] = [];
+    for (const id of ids) {
+      const rec = installs.packages[id];
+      const { removed, errors } = removeTrackedPackageFiles(skyrim, rec);
+      filesRemoved += removed;
+      if (errors.length) {
+        packageErrors.push(`${rec.name || id}: ${errors[0]}`);
+      }
+      delete installs.packages[id];
+    }
+    writeInstalls(installs);
+    playLog(
+      `uninstallAllMods packages=${ids.length} filesRemoved=${filesRemoved} errors=${packageErrors.length}`
+    );
+
+    if (packageErrors.length) {
+      return {
+        ok: false,
+        error: `Removed most packages, but some files failed: ${packageErrors[0]}`,
+        packagesRemoved: ids.length,
+        filesRemoved,
+      };
+    }
+
+    return {
+      ok: true,
+      packagesRemoved: ids.length,
+      filesRemoved,
+      playPath: skyrim,
+      message: `Uninstalled ${ids.length} package(s) (${filesRemoved} files) from the VOA game folder.`,
+    };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+});
+
+/**
+ * TEMP workaround until Nexus OAuth client is registered:
+ * User downloads the zip themselves from nexusmods.com in a browser,
+ * then picks it here. We extract + remap SKSE/ → Data/SKSE/ (no rehost).
+ */
+ipcMain.handle(
+  "voa:installModFromZip",
+  async (
+    _e,
+    payload?: { packageId?: string; name?: string; version?: string; remapSkseToData?: boolean }
+  ): Promise<{ ok: boolean; error?: string; installed?: InstalledModRecord; canceled?: boolean }> => {
+    const packageId = String(payload?.packageId || "manual-package").trim() || "manual-package";
+    const displayName = String(payload?.name || packageId);
+    const version = String(payload?.version || "manual");
+    const remapSkse = payload?.remapSkseToData !== false; // default true for Address Library style zips
+
+    const playRoot = resolvePlayableSkyrim();
+    if (!playRoot.ok || !playRoot.path) {
+      return {
+        ok: false,
+        error: playRoot.error || "Set your base Skyrim folder in Settings first",
+      };
+    }
+    const skyrim = playRoot.path;
+    if (!fs.existsSync(path.join(skyrim, "SkyrimSE.exe"))) {
+      return { ok: false, error: "VOA game folder looks invalid (SkyrimSE.exe missing)" };
+    }
+
+    const pick = await dialog.showOpenDialog({
+      title: `Select ${displayName} zip (from Nexus Mods download)`,
+      properties: ["openFile"],
+      filters: [{ name: "Zip archives", extensions: ["zip", "7z"] }],
+    });
+    if (pick.canceled || !pick.filePaths[0]) {
+      return { ok: false, canceled: true, error: "Canceled" };
+    }
+    const zipPath = pick.filePaths[0];
+    if (!/\.zip$/i.test(zipPath)) {
+      return {
+        ok: false,
+        error: "Please select a .zip file (download the All-in-one package from Nexus, then pick it here).",
+      };
+    }
+
+    const tmpRoot = path.join(app.getPath("temp"), "voa-mods-manual", packageId);
+    const extractDir = path.join(tmpRoot, "extract");
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+      fs.mkdirSync(extractDir, { recursive: true });
+
+      emitModProgress({
+        packageId,
+        phase: "extract",
+        received: 0,
+        total: 0,
+        percent: 100,
+        message: "Extracting local zip…",
+      });
+      await extractZip(zipPath, extractDir);
+
+      const installs = readInstalls();
+      const previous = installs.packages[packageId];
+      if (previous?.files?.length) {
+        for (const rel of previous.files) {
+          const abs = path.join(skyrim, rel);
+          try {
+            if (fs.existsSync(abs)) fs.unlinkSync(abs);
+            pruneEmptyDirs(abs, skyrim);
+          } catch {
+            /* best-effort */
+          }
+        }
+      }
+
+      emitModProgress({
+        packageId,
+        phase: "install",
+        received: 0,
+        total: 0,
+        percent: 100,
+        message: "Installing files…",
+      });
+
+      const staged = listFilesRecursive(extractDir);
+      const installedFiles: string[] = [];
+      for (const rel of staged) {
+        const destRel = remapNexusInstallRel(rel, remapSkse);
+        const destAbs = path.join(skyrim, destRel);
+        const srcAbs = path.join(extractDir, rel);
+        copyFileEnsuringDir(srcAbs, destAbs);
+        installedFiles.push(destRel.split(path.sep).join("/"));
+      }
+
+      const record: InstalledModRecord = {
+        id: packageId,
+        version,
+        name: displayName,
+        installedAt: new Date().toISOString(),
+        files: installedFiles,
+      };
+      installs.packages[packageId] = record;
+      writeInstalls(installs);
+
+      emitModProgress({
+        packageId,
+        phase: "done",
+        received: installedFiles.length,
+        total: installedFiles.length,
+        percent: 100,
+        message: `Installed ${installedFiles.length} file(s) from zip`,
+      });
+
+      return { ok: true, installed: record };
+    } catch (e: any) {
+      emitModProgress({
+        packageId,
+        phase: "error",
+        received: 0,
+        total: 0,
+        percent: 0,
+        message: e?.message || String(e),
+      });
+      return { ok: false, error: e?.message || String(e) };
+    } finally {
+      try {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
   }
 );

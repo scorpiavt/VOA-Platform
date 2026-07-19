@@ -69,3 +69,33 @@ export function toPublicUser(user: DbUser) {
     banned: Boolean(user.banned),
   };
 }
+
+/** Cache Discord role IDs from OAuth or bot (for staff Admin tab without bot on every request). */
+export function saveUserStaffRoles(userId: number, roleIds: string[]): void {
+  const now = new Date().toISOString();
+  getDb()
+    .prepare(
+      `UPDATE users SET staff_roles_json = ?, staff_checked_at = ?, updated_at = ? WHERE id = ?`
+    )
+    .run(JSON.stringify(roleIds || []), now, now, userId);
+}
+
+export function getUserStaffRoleCache(userId: number): {
+  roleIds: string[];
+  checkedAt: string | null;
+} {
+  const row = getDb()
+    .prepare(`SELECT staff_roles_json, staff_checked_at FROM users WHERE id = ?`)
+    .get(userId) as
+    | { staff_roles_json: string | null; staff_checked_at: string | null }
+    | undefined;
+  if (!row) return { roleIds: [], checkedAt: null };
+  let roleIds: string[] = [];
+  try {
+    const parsed = JSON.parse(row.staff_roles_json || "[]");
+    if (Array.isArray(parsed)) roleIds = parsed.map(String);
+  } catch {
+    roleIds = [];
+  }
+  return { roleIds, checkedAt: row.staff_checked_at };
+}

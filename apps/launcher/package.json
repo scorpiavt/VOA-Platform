@@ -1,6 +1,6 @@
 {
   "name": "voa-launcher",
-  "version": "0.1.0",
+  "version": "0.2.16",
   "private": true,
   "description": "Visions of Aetherius launcher",
   "author": "Visions of Aetherius",
@@ -12,8 +12,9 @@
     "preview": "vite preview",
     "start:electron": "electron .",
     "pack": "npm run build && electron-builder --dir",
-    "dist": "npm run build && electron-builder --win portable",
-    "dist:public": "npm run build && electron-builder --win portable",
+    "dist": "npm run build && electron-builder --win portable nsis",
+    "dist:public": "npm run build && electron-builder --win portable nsis",
+    "dist:portable": "npm run build && electron-builder --win portable",
     "dist:nsis": "npm run build && electron-builder --win nsis"
   },
   "dependencies": {
@@ -65,6 +66,14 @@
       {
         "from": "../../client-dist/skymp5-client.js",
         "to": "client/skymp5-client.js"
+      },
+      {
+        "from": "../../client-dist/Interface/Controls/PC/controlmap.txt",
+        "to": "client/Interface/Controls/PC/controlmap.txt"
+      },
+      {
+        "from": "public/music/launcher-theme.mp3",
+        "to": "music/launcher-theme.mp3"
       }
     ],
     "win": {
@@ -74,20 +83,32 @@
       "target": [
         {
           "target": "portable",
-          "arch": [
-            "x64"
-          ]
+          "arch": ["x64"]
+        },
+        {
+          "target": "nsis",
+          "arch": ["x64"]
         }
-      ],
-      "artifactName": "VisionsOfAetherius-${version}-portable.${ext}"
+      ]
     },
     "portable": {
       "artifactName": "VisionsOfAetherius-${version}-portable.exe"
     },
     "nsis": {
       "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
       "allowToChangeInstallationDirectory": true,
-      "artifactName": "VisionsOfAetherius-Setup-${version}.${ext}"
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Visions of Aetherius",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "artifactName": "VisionsOfAetherius-Setup-${version}.${ext}",
+      "uninstallDisplayName": "Visions of Aetherius Launcher"
     },
     "asar": true,
     "protocols": [

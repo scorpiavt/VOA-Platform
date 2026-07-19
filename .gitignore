@@ -23,3 +23,7 @@ backup-platform-plugins/
 backup-runtime-deps/
 
 public-release/*.exe
+public-release/*.zip
+GrokAPI.env
+tmp-*.png
+*.png.bak

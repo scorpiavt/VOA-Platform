@@ -1,5 +1,0 @@
-﻿Manual install (only if automatic Play install fails):
-1. Install SKSE64 + Skyrim Platform for your Skyrim SE/AE version
-2. Copy skymp5-client.js into:
-   <Skyrim>\Data\Platform\Plugins\
-3. Prefer using VisionsOfAetherius.exe â†’ Login â†’ Play (writes settings automatically)

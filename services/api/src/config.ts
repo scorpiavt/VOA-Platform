@@ -50,10 +50,31 @@ export const config = {
     (process.env.REQUIRE_DISCORD_GUILD ?? "").toLowerCase() === "true" ||
     ((process.env.REQUIRE_DISCORD_GUILD ?? "").toLowerCase() !== "false" &&
       Boolean((process.env.DISCORD_GUILD_ID ?? "").trim())),
+  /**
+   * Emergency allow-list of Discord user snowflakes (optional).
+   * Prefer ADMIN_DISCORD_ROLE_IDS — staff access is primarily role-based.
+   */
   adminDiscordIds: (process.env.ADMIN_DISCORD_IDS ?? "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
+  /**
+   * Discord role snowflakes that grant launcher Admin / staff bug tools.
+   * Defaults: Founder, Senior Gamemaster, Gamemaster.
+   */
+  adminDiscordRoleIds: (
+    process.env.ADMIN_DISCORD_ROLE_IDS ??
+    "1521249000748224554,1522731546329481449,1522747699273793626"
+  )
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+  /** Role display names (for UI only; keyed by same order as defaults) */
+  adminDiscordRoleLabels: {
+    "1521249000748224554": "Founder",
+    "1522731546329481449": "Senior Gamemaster",
+    "1522747699273793626": "Gamemaster",
+  } as Record<string, string>,
   gameServerIp: process.env.GAME_SERVER_IP ?? "178.156.158.116",
   gameServerPort: num("GAME_SERVER_PORT", 10000),
   gameServerName: process.env.GAME_SERVER_NAME ?? "Visions of Aetherius",
@@ -66,6 +87,22 @@ export const config = {
     process.env.GAME_STATUS_URL ??
     `http://${process.env.GAME_SERVER_IP ?? "178.156.158.116"}:3099/status`,
   maxPlayers: num("MAX_PLAYERS", 50),
+  /**
+   * Shared secret for game-server → API calls (character bind/wipe/state).
+   * Falls back to JWT_SECRET when unset (dev only).
+   */
+  gameServerSecret: (
+    process.env.GAME_SERVER_SECRET ||
+    process.env.JWT_SECRET ||
+    "dev-only-change-me"
+  ).trim(),
+  /**
+   * Nexus Mods personal API key — server-side only (never ship to launcher).
+   * Used for catalog/metadata and future Nexus-compliant downloads.
+   * Do NOT host Nexus archives on the VOA CDN.
+   */
+  nexusApiKey: (process.env.NEXUS_API_KEY ?? "").trim(),
+  nexusAppName: (process.env.NEXUS_APP_NAME ?? "VisionsOfAetherius").trim(),
 };
 
 export function discordConfigured(): boolean {

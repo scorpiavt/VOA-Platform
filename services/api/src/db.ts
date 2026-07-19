@@ -13,6 +13,9 @@ export type DbUser = {
   banned: number;
   created_at: string;
   updated_at: string;
+  /** JSON array of Discord role snowflakes last seen for staff checks */
+  staff_roles_json?: string | null;
+  staff_checked_at?: string | null;
 };
 
 export type DbSession = {
@@ -105,8 +108,136 @@ export function initDb(): void {
       last_played_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      actor_form_id INTEGER,
+      world_or_cell INTEGER,
+      pos_x REAL,
+      pos_y REAL,
+      pos_z REAL,
+      angle_z REAL,
+      equipment_json TEXT,
+      inventory_json TEXT,
+      appearance_json TEXT,
+      map_markers_json TEXT,
       UNIQUE(user_id, slot)
     );
+
+    CREATE TABLE IF NOT EXISTS character_wipes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      profile_id INTEGER NOT NULL,
+      actor_form_id INTEGER NOT NULL,
+      slot INTEGER,
+      user_id INTEGER,
+      created_at TEXT NOT NULL,
+      done INTEGER NOT NULL DEFAULT 0,
+      done_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_character_wipes_pending
+      ON character_wipes(done, profile_id);
+
+    CREATE TABLE IF NOT EXISTS bug_reports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      profile_id INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL,
+      category TEXT NOT NULL DEFAULT 'other',
+      status TEXT NOT NULL DEFAULT 'open',
+      launcher_version TEXT,
+      game_version TEXT,
+      character_slot INTEGER,
+      character_name TEXT,
+      staff_note TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_bug_reports_user
+      ON bug_reports(user_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_bug_reports_status
+      ON bug_reports(status, id DESC);
+
+    CREATE TABLE IF NOT EXISTS user_warnings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      staff_user_id INTEGER,
+      note TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_user_warnings_user
+      ON user_warnings(user_id, id DESC);
+
+    CREATE TABLE IF NOT EXISTS admin_actions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      action TEXT NOT NULL,
+      target_user_id INTEGER,
+      target_profile_id INTEGER,
+      target_character_id INTEGER,
+      target_actor_form_id INTEGER,
+      target_slot INTEGER,
+      staff_user_id INTEGER,
+      note TEXT,
+      payload_json TEXT,
+      done INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      done_at TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_admin_actions_pending
+      ON admin_actions(done, id ASC);
+  `);
+
+  // Migrations for DBs created before world-state columns existed
+  const charCols = (
+    db.prepare(`PRAGMA table_info(characters)`).all() as { name: string }[]
+  ).map((c) => c.name);
+  const addCharCol = (name: string, ddl: string) => {
+    if (!charCols.includes(name)) {
+      db.exec(`ALTER TABLE characters ADD COLUMN ${ddl}`);
+    }
+  };
+  addCharCol("actor_form_id", "actor_form_id INTEGER");
+  addCharCol("world_or_cell", "world_or_cell INTEGER");
+  addCharCol("pos_x", "pos_x REAL");
+  addCharCol("pos_y", "pos_y REAL");
+  addCharCol("pos_z", "pos_z REAL");
+  addCharCol("angle_z", "angle_z REAL");
+  addCharCol("equipment_json", "equipment_json TEXT");
+  addCharCol("inventory_json", "inventory_json TEXT");
+  addCharCol("appearance_json", "appearance_json TEXT");
+  addCharCol("map_markers_json", "map_markers_json TEXT");
+
+  // Staff role cache (OAuth guilds.members.read or bot member fetch)
+  const userCols = (
+    db.prepare(`PRAGMA table_info(users)`).all() as { name: string }[]
+  ).map((c) => c.name);
+  if (!userCols.includes("staff_roles_json")) {
+    db.exec(`ALTER TABLE users ADD COLUMN staff_roles_json TEXT`);
+  }
+  if (!userCols.includes("staff_checked_at")) {
+    db.exec(`ALTER TABLE users ADD COLUMN staff_checked_at TEXT`);
+  }
+
+  // Support log metadata (files live under data/support-logs/, not public CDN)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS support_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      profile_id INTEGER NOT NULL,
+      discord_id TEXT NOT NULL,
+      username TEXT NOT NULL,
+      reason TEXT,
+      launcher_version TEXT,
+      consent INTEGER NOT NULL DEFAULT 1,
+      size_bytes INTEGER NOT NULL,
+      file_name TEXT NOT NULL,
+      sha256 TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_support_logs_user ON support_logs(user_id);
+    CREATE INDEX IF NOT EXISTS idx_support_logs_created ON support_logs(created_at);
   `);
 
   const count = db.prepare("SELECT COUNT(*) AS c FROM news").get() as { c: number };
