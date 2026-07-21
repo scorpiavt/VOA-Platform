@@ -7,8 +7,11 @@ import { config } from "./config";
 import { initDb } from "./db";
 import { registerRoutes } from "./routes";
 import { ensureLauncherUpdateDefaults } from "./launcherUpdate";
+import { assertNoNexusPersonalApiKey } from "./nexus";
 
 async function main() {
+  // Nexus §1 — refuse to start if any personal API key is configured
+  assertNoNexusPersonalApiKey();
   initDb();
   ensureLauncherUpdateDefaults();
 

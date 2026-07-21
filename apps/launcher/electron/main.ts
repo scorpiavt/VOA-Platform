@@ -4360,8 +4360,14 @@ type NexusDownloadLink = {
 
 /**
  * Resolve a short-lived Nexus CDN URL using the player's OAuth access token.
- * Free vs Premium follows the logged-in Nexus account (Bearer), not a VOA key.
- * Premium gets direct download_link; Free may be limited by Nexus policy.
+ *
+ * Nexus §1–§2 (letter of the law):
+ * - Authorization: Bearer <user OAuth access_token> ONLY
+ * - NEVER sends `apikey` header
+ * - NEVER uses a personal / server API key
+ * - Caller downloads the returned HTTPS CDN URI directly (no VOA proxy)
+ *
+ * Free vs Premium follows the logged-in Nexus account.
  */
 async function getNexusDownloadUriWithOAuth(
   accessToken: string,
@@ -4369,12 +4375,19 @@ async function getNexusDownloadUriWithOAuth(
   modId: number,
   fileId: number
 ): Promise<string> {
+  const token = String(accessToken || "").trim();
+  if (!token) {
+    throw new Error(
+      "[VOA compliance] Nexus user OAuth access token required. Log in under Account → Nexus Mods."
+    );
+  }
   const url = `https://api.nexusmods.com/v1/games/${encodeURIComponent(
     gameDomain
   )}/mods/${modId}/files/${fileId}/download_link.json`;
   const res = await fetch(url, {
     headers: {
-      Authorization: `Bearer ${accessToken}`,
+      // OAuth user token ONLY — never "apikey"
+      Authorization: `Bearer ${token}`,
       "Application-Name": "VisionsOfAetherius",
       "Application-Version": app.getVersion() || "0.2.0",
       accept: "application/json",
@@ -4407,16 +4420,28 @@ async function getNexusDownloadUriWithOAuth(
       "Nexus returned no download links. Premium accounts get direct downloads; Free may need to open the mod page on nexusmods.com once, or upgrade."
     );
   }
-  const raw = links[0].URI;
+  const raw = String(links[0].URI || "").trim();
   try {
     const u = new URL(raw);
+    if (u.protocol !== "https:") {
+      throw new Error(
+        "[VOA compliance] Nexus CDN URI must be HTTPS (direct download only)"
+      );
+    }
     u.pathname = u.pathname
       .split("/")
       .map((p) => encodeURIComponent(decodeURIComponent(p)))
       .join("/");
     return u.toString();
-  } catch {
-    return raw.replace(/ /g, "%20");
+  } catch (e) {
+    if (e instanceof Error && e.message.includes("VOA compliance")) throw e;
+    const fixed = raw.replace(/ /g, "%20");
+    if (!fixed.startsWith("https://")) {
+      throw new Error(
+        "[VOA compliance] Nexus CDN URI must be HTTPS (direct download only)"
+      );
+    }
+    return fixed;
   }
 }
 
@@ -4758,7 +4783,7 @@ ipcMain.handle(
         Boolean(nexusModId && nexusFileId && nexusGame) ||
         Boolean(nexusFallback);
 
-      // Local packages need the VOA archive; Nexus packages need the user's key only.
+      // Local packages need the VOA archive; Nexus packages need user OAuth only.
       if (pkg.available === false && !isNexus) {
         throw new Error("Package archive is not available on the server");
       }
@@ -5445,9 +5470,10 @@ ipcMain.handle("voa:uninstallAllMods", async () => {
 });
 
 /**
- * TEMP workaround until Nexus OAuth client is registered:
- * User downloads the zip themselves from nexusmods.com in a browser,
- * then picks it here. We extract + remap SKSE/ → Data/SKSE/ (no rehost).
+ * Optional user-sourced zip install (still Nexus-compliant §1–§2 / §6):
+ * User obtains the archive themselves (e.g. browser download from nexusmods.com),
+ * then picks the local file. VOA never rehosts Nexus bytes and still validates
+ * every path before install (zip-slip guard). Primary path remains OAuth → CDN.
  */
 ipcMain.handle(
   "voa:installModFromZip",

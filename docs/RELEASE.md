@@ -62,12 +62,26 @@ Prefer HTTPS + domain before broader public launch.
 ```json
 {
   "version": "0.1.1",
-  "downloadUrl": "http://178.156.158.116:3100/cdn/launcher/VisionsOfAetherius.exe",
+  "downloadUrl": "https://api.visionsofaetherius.com/cdn/launcher/VisionsOfAetherius-update.zip",
+  "sha256": "<64-char hex of the zip/exe>",
+  "signature": "<Ed25519 base64 from scripts/sign-launcher-update.mjs>",
+  "size": 12345678,
   "notes": "What changed",
   "minVersion": "0.1.1",
-  "channel": "stable"
+  "channel": "stable",
+  "format": "zip"
 }
 ```
+
+**Required (Nexus §3–§4):** `downloadUrl` must be **HTTPS** for public hosts; **`sha256` and `signature` are mandatory**. Generate with:
+
+```bash
+# Private key offline only — never commit
+export VOA_UPDATE_SIGNING_KEY=...
+node scripts/sign-launcher-update.mjs --artifact path/to/VisionsOfAetherius-update.zip --version 0.1.1 --url https://api.visionsofaetherius.com/cdn/launcher/VisionsOfAetherius-update.zip
+```
+
+Unsigned or HTTP public manifests are **refused** by the API and launcher.
 
 5. No API restart required (manifest is read from disk each request).
 

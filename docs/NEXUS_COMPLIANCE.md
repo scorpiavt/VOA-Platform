@@ -8,9 +8,11 @@ This document maps **each** Nexus code-review requirement to an **enforced** imp
 
 | Status | **Enforced** |
 |--------|----------------|
-| Code | `services/api/src/nexus.ts` — **no** `apikey` header, **no** `NEXUS_API_KEY` env usage |
+| Code | `services/api/src/nexus.ts` — **no** download client, **no** `apikey` header, **no** `NEXUS_API_KEY` usage |
+| Startup | `assertNoNexusPersonalApiKey()` in `index.ts` — process **refuses to start** if `NEXUS_API_KEY` (or aliases) is set |
 | Config | `config.ts` does **not** expose a personal Nexus API key |
-| Env example | `NEXUS_API_KEY` **removed** from `.env.example` |
+| Routes | `GET /v1/mods/:id/download` returns **400** for `source: "nexus"` (never streams Nexus bytes) |
+| Env example | `NEXUS_API_KEY` **removed** from `.env.example` (comment forbids it) |
 
 **Production download path (only):** user OAuth Bearer token in the **launcher**, never on the VOA API server for file downloads.
 

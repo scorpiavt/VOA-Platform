@@ -58,6 +58,7 @@ import {
   listAdminCharacters,
   listPendingAdminActions,
   listUserWarnings,
+  queueAdminAction,
   runCharacterAdminAction,
 } from "./adminModeration";
 import {
@@ -230,6 +231,189 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       profileId,
       roles: staff.roleLabels,
       method: staff.method,
+    };
+  });
+
+  /**
+   * In-game staff console (bypass broken CustomEvent path).
+   * Client posts with game session; game server polls pending-admin-actions
+   * and runs mp._voaConsole via Chakra.
+   */
+  app.post("/v1/game/console-command", async (req, reply) => {
+    const body = (req.body || {}) as {
+      session?: string;
+      profileId?: number;
+      command?: string;
+      args?: unknown;
+    };
+    const session = String(body.session || "").trim();
+    const command = String(body.command || "")
+      .trim()
+      .toLowerCase()
+      .slice(0, 48);
+    if (!session || !command) {
+      return reply.code(400).send({ error: "session and command required" });
+    }
+    const allowed = new Set([
+      "listplayers",
+      "players",
+      "announce",
+      "tp",
+      "tpto",
+      "goto",
+      "summon",
+      "bring",
+      "giveplayerspell",
+      "givespell",
+      "addspell",
+      "additem",
+    ]);
+    if (!allowed.has(command)) {
+      return reply.code(400).send({ error: "unknown command: " + command });
+    }
+    const row = getDb()
+      .prepare(
+        `SELECT user_id, profile_id FROM game_sessions
+         WHERE session_id = ? AND datetime(expires_at) > datetime('now')`
+      )
+      .get(session) as { user_id: number; profile_id: number } | undefined;
+    if (!row) {
+      return reply.code(401).send({ error: "Invalid or expired session" });
+    }
+    if (
+      typeof body.profileId === "number" &&
+      body.profileId > 0 &&
+      body.profileId !== row.profile_id
+    ) {
+      return reply.code(403).send({ error: "profile mismatch" });
+    }
+    const user = getDb()
+      .prepare(`SELECT * FROM users WHERE id = ?`)
+      .get(row.user_id) as DbUser | undefined;
+    if (!user || user.banned) {
+      return reply.code(403).send({ error: "not allowed" });
+    }
+    const staff = await checkStaffAccess(user.discord_id);
+    if (!staff.isStaff) {
+      return reply.code(403).send({ error: "Admin only", isStaff: false });
+    }
+    let args: unknown[] = [];
+    if (Array.isArray(body.args)) args = body.args;
+    else if (body.args != null) args = [body.args];
+    // normalize aliases in payload
+    let cmd = command;
+    if (cmd === "players") cmd = "listplayers";
+    if (cmd === "bring") cmd = "summon";
+    if (cmd === "tpto" || cmd === "goto") cmd = "tp";
+    if (cmd === "givespell" || cmd === "addspell") cmd = "giveplayerspell";
+    const id = queueAdminAction({
+      action: "console_cmd",
+      staffUserId: user.id,
+      targetProfileId: row.profile_id,
+      payload: {
+        cmd,
+        args,
+        staffProfileId: row.profile_id,
+      },
+    });
+    return {
+      ok: true,
+      queued: true,
+      id,
+      command: cmd,
+      args,
+      profileId: row.profile_id,
+    };
+  });
+
+  /**
+   * In-game player interact (give name / trade) — bypasses broken CustomEvent.
+   * Any logged-in session can queue; game server runs mp._voaInteract.
+   */
+  app.post("/v1/game/interact", async (req, reply) => {
+    const body = (req.body || {}) as {
+      session?: string;
+      profileId?: number;
+      action?: string;
+      targetRemoteId?: number;
+      payload?: unknown;
+    };
+    const session = String(body.session || "").trim();
+    const action = String(body.action || "")
+      .trim()
+      .toLowerCase()
+      .slice(0, 48);
+    if (!session || !action) {
+      return reply.code(400).send({ error: "session and action required" });
+    }
+    const allowed = new Set([
+      "givename",
+      "giveName",
+      "givename_nearby",
+      "giveName_nearby",
+      "trade_request",
+      "trade_accept",
+      "trade_decline",
+      "trade_cancel",
+      "trade_ready",
+      "trade_offer",
+    ]);
+    // normalize to lower for allow list check
+    const actKey = action.replace(/_/g, "").toLowerCase();
+    const allowedNorm = new Set(
+      [...allowed].map((a) => a.replace(/_/g, "").toLowerCase())
+    );
+    if (!allowedNorm.has(actKey) && !allowed.has(action)) {
+      // still allow known snake_case from client
+      const okAct =
+        action === "givename" ||
+        action === "givename_nearby" ||
+        action.startsWith("trade_");
+      if (!okAct) {
+        return reply.code(400).send({ error: "unknown action: " + action });
+      }
+    }
+    const row = getDb()
+      .prepare(
+        `SELECT user_id, profile_id FROM game_sessions
+         WHERE session_id = ? AND datetime(expires_at) > datetime('now')`
+      )
+      .get(session) as { user_id: number; profile_id: number } | undefined;
+    if (!row) {
+      return reply.code(401).send({ error: "Invalid or expired session" });
+    }
+    if (
+      typeof body.profileId === "number" &&
+      body.profileId > 0 &&
+      body.profileId !== row.profile_id
+    ) {
+      return reply.code(403).send({ error: "profile mismatch" });
+    }
+    const user = getDb()
+      .prepare(`SELECT * FROM users WHERE id = ?`)
+      .get(row.user_id) as DbUser | undefined;
+    if (!user || user.banned) {
+      return reply.code(403).send({ error: "not allowed" });
+    }
+    const id = queueAdminAction({
+      action: "interact_cmd",
+      staffUserId: user.id,
+      targetProfileId: row.profile_id,
+      targetActorFormId:
+        typeof body.targetRemoteId === "number" ? body.targetRemoteId : null,
+      payload: {
+        action,
+        targetRemoteId: Number(body.targetRemoteId) || 0,
+        payload: body.payload || {},
+        fromProfileId: row.profile_id,
+      },
+    });
+    return {
+      ok: true,
+      queued: true,
+      id,
+      action,
+      profileId: row.profile_id,
     };
   });
 
@@ -773,11 +957,7 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
    * plus last saved position / gear / inventory / map markers.
    */
   app.get("/v1/game/character-binding", async (req, reply) => {
-    try {
-      requireGameSecret(req);
-    } catch (e: any) {
-      return reply.code(e?.statusCode || 401).send({ error: e?.message || "unauthorized" });
-    }
+    // Auth: game secret (scamp) OR valid game session (client look restore)
     const q = req.query as {
       profileId?: string;
       slot?: string;
@@ -785,15 +965,30 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
     };
     let profileId = Number(q.profileId);
     let slot = Number(q.slot);
-    if (q.session) {
+    const headerSecret = String(req.headers["x-voa-game-secret"] || "").trim();
+    const qSecret = String((q as { secret?: string }).secret || "").trim();
+    const secret = headerSecret || qSecret;
+    let authed = false;
+    if (secret && secret === config.gameServerSecret) {
+      authed = true;
+    } else if (q.session) {
       const row = sessionRow(String(q.session));
       if (!row) return reply.code(401).send({ error: "Invalid session" });
       profileId = row.profile_id;
+      authed = true;
       if (!(slot >= 0 && slot <= 1)) {
         const meta = getDb()
           .prepare(`SELECT value FROM meta WHERE key = ?`)
           .get(`session_slot:${q.session}`) as { value: string } | undefined;
         slot = meta ? Number(meta.value) : 0;
+      }
+    }
+    if (!authed) {
+      try {
+        requireGameSecret(req);
+        authed = true;
+      } catch (e: any) {
+        return reply.code(e?.statusCode || 401).send({ error: e?.message || "unauthorized" });
       }
     }
     if (!(profileId > 0) || !(slot >= 0 && slot <= 1)) {
@@ -1074,8 +1269,10 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
   /**
    * Stream a local VOA package archive for the launcher download manager.
-   * Nexus packages are NOT proxied here — the launcher downloads them with the
-   * user's personal Nexus API key so Free/Premium is applied to their account.
+   *
+   * Nexus packages are NEVER streamed or proxied here (Nexus §1–§2):
+   * the launcher uses user-initiated OAuth (Bearer access_token) →
+   * download_link.json → direct HTTPS CDN. No personal apikey. No rehost.
    */
   app.get("/v1/mods/:id/download", async (req, reply) => {
     const { id } = req.params as { id: string };
@@ -1086,9 +1283,11 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
     if (meta.source === "nexus") {
       return reply.code(400).send({
-        error: "Nexus packages must be downloaded with your own Nexus account",
-        hint: "Log in to Nexus Mods in the launcher Account tab (browser OAuth). VOA does not proxy Nexus downloads.",
+        error:
+          "Nexus packages are not hosted by VOA. Use launcher Nexus OAuth (browser login), then direct CDN download.",
+        hint: "Account tab → Log in to Nexus Mods (OAuth). Install uses your user Bearer token only — never a server personal API key.",
         source: "nexus",
+        architecture: "oauth-user-initiated-direct-cdn",
         nexusGame: meta.nexusGame,
         nexusModId: meta.nexusModId,
         nexusFileId: meta.nexusFileId,
