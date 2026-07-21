@@ -8940,14 +8940,13 @@ System.register("skymp5-client/src/front/voaFx", ["build/dist/client/Data/Platfo
         }
     };
 });
-
 /* === VOA proximity voice plugin (appended) === */
 /**
  * VOA proximity voice — in-game (Keizaal-style).
  *
  * - Fetches LiveKit token from VOA API (game session)
  * - Injects CEF voice HUD + LiveKit client
- * - PTT + whisper/normal/shout keybinds (rebindable via storage)
+ * - PTT + one mode-cycle key (normal → shout → whisper → normal)
  * - Pushes local pos + nearby profile distances into CEF for spatial gain
  *
  * Mic/WebRTC live in CEF (in-process overlay), not a separate desktop app.
@@ -8970,11 +8969,12 @@ System.register("skymp5-client/src/front/voaFx", ["build/dist/client/Data/Platfo
   var enabled = false;
   var connecting = false;
   var connected = false;
-  var mode = "normal"; // whisper | normal | shout
+  var mode = "normal"; // whisper | normal | shout — cycle: normal → shout → whisper → normal
+  var MODE_CYCLE = ["normal", "shout", "whisper"];
   var pttHeld = false;
   var lastStatePost = 0;
   var lastTokenAt = 0;
-  var keybinds = { ptt: "V", whisper: "Z", normal: "X", shout: "C" };
+  var keybinds = { ptt: "V", cycle: "B" };
   var ranges = { whisper: 800, normal: 2200, shout: 6000 };
   var prevKeys = {};
   var dxKey = null;
@@ -9218,6 +9218,14 @@ System.register("skymp5-client/src/front/voaFx", ["build/dist/client/Data/Platfo
     } catch (e) {}
   }
 
+  /** normal → shout → whisper → normal */
+  function cycleMode() {
+    var idx = MODE_CYCLE.indexOf(mode);
+    if (idx < 0) idx = 0;
+    var next = MODE_CYCLE[(idx + 1) % MODE_CYCLE.length];
+    setMode(next);
+  }
+
   function setPtt(down) {
     if (pttHeld === down) return;
     pttHeld = down;
@@ -9242,6 +9250,7 @@ System.register("skymp5-client/src/front/voaFx", ["build/dist/client/Data/Platfo
     H: 0x23,
     T: 0x14,
     Y: 0x15,
+    R: 0x13,
   };
 
   function keyDown(letter) {
@@ -9410,12 +9419,12 @@ System.register("skymp5-client/src/front/voaFx", ["build/dist/client/Data/Platfo
         if (ptt.down && !pttHeld) setPtt(true);
         if (!ptt.down && pttHeld) setPtt(false);
 
-        var w = edge("whisper", keybinds.whisper || "Z");
-        var n = edge("normal", keybinds.normal || "X");
-        var s = edge("shout", keybinds.shout || "C");
-        if (w.pressed) setMode("whisper");
-        if (n.pressed) setMode("normal");
-        if (s.pressed) setMode("shout");
+        // One key cycles: normal → shout → whisper → normal
+        var cyc = edge(
+          "cycle",
+          keybinds.cycle || keybinds.mode || keybinds.whisper || "B"
+        );
+        if (cyc.pressed) cycleMode();
       } else if (pttHeld) {
         setPtt(false);
       }

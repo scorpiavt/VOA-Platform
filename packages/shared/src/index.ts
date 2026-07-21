@@ -154,9 +154,8 @@ export type VoiceRanges = z.infer<typeof VoiceRangesSchema>;
 
 export const VoiceKeybindsSchema = z.object({
   ptt: z.string(),
-  whisper: z.string(),
-  normal: z.string(),
-  shout: z.string(),
+  /** Single key cycles normal → shout → whisper → normal */
+  cycle: z.string(),
 });
 export type VoiceKeybinds = z.infer<typeof VoiceKeybindsSchema>;
 

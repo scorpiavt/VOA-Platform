@@ -98,10 +98,12 @@ Or launcher JWT: `Authorization: Bearer <accessToken>`.
 
 | Action | Key |
 |--------|-----|
-| PTT | V |
-| Whisper | Z |
-| Normal | X |
-| Shout | C |
+| PTT (hold) | V |
+| Mode cycle | B |
+
+Mode cycle order (starts at **Normal**):
+
+**Normal → Shout → Whisper → Normal → …**
 
 ## Security
 

@@ -306,6 +306,14 @@
     publishPosData(true);
   }
 
+  /** normal → shout → whisper → normal */
+  function cycleMode() {
+    var order = ["normal", "shout", "whisper"];
+    var idx = order.indexOf(state.mode);
+    if (idx < 0) idx = 0;
+    setMode(order[(idx + 1) % order.length]);
+  }
+
   async function setPtt(down) {
     state.ptt = !!down;
     setHud();
@@ -355,6 +363,7 @@
     connect: connect,
     disconnect: disconnect,
     setMode: setMode,
+    cycleMode: cycleMode,
     setPtt: setPtt,
     updateWorld: updateWorld,
     getState: function () {

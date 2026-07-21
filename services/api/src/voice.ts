@@ -15,11 +15,10 @@ export const VOICE_RANGES: Record<VoiceMode, number> = {
   shout: 6000,
 };
 
+/** ptt = push-to-talk; cycle = single key: normal → shout → whisper → normal */
 export const DEFAULT_VOICE_KEYBINDS = {
   ptt: "V",
-  whisper: "Z",
-  normal: "X",
-  shout: "C",
+  cycle: "B",
 } as const;
 
 export function voiceEnabled(): boolean {
