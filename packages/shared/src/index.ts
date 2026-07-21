@@ -91,17 +91,20 @@ export const ClientUpdateManifestSchema = z.object({
 });
 export type ClientUpdateManifest = z.infer<typeof ClientUpdateManifestSchema>;
 
-/** Public launcher self-update manifest (portable .exe) */
+/** Public launcher self-update manifest — sha256 + Ed25519 signature required (Nexus §4) */
 export const LauncherUpdateSchema = z.object({
-  version: z.string(),
-  /** Absolute URL to download the portable launcher */
-  downloadUrl: z.string(),
-  sha256: z.string().optional(),
+  version: z.string().min(1),
+  /** Absolute HTTPS URL to the launcher artifact */
+  downloadUrl: z.string().url(),
+  /** SHA-256 hex of the artifact (required) */
+  sha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
+  /** Ed25519 signature base64 over canonical payload (required in production) */
+  signature: z.string().min(1),
   size: z.number().int().nonnegative().optional(),
   notes: z.string().optional(),
-  /** If client version is below this, update is mandatory before Play */
   minVersion: z.string().optional(),
   channel: z.enum(["stable", "beta"]).optional(),
+  format: z.enum(["portable", "zip"]).optional(),
 });
 export type LauncherUpdate = z.infer<typeof LauncherUpdateSchema>;
 

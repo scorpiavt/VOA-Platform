@@ -62,11 +62,12 @@ GraphQL (metadata only): [graphql.nexusmods.com](https://graphql.nexusmods.com/#
 |--------|--------|
 | **App name** | Visions of Aetherius Launcher |
 | **GitHub** | https://github.com/scorpiavt/VOA-Platform |
-| **Callback URL** | `http://127.0.0.1:47821/auth/nexus/callback` (and `http://localhost:47821/auth/nexus/callback`) |
-| **Scopes** | User identity; user-initiated download of curated SSE mod files listed by the launcher |
-| **Headers** | `Application-Name: VisionsOfAetheriusLauncher`, `Application-Version: <semver>` |
+| **Compliance doc** | [`docs/NEXUS_COMPLIANCE.md`](docs/NEXUS_COMPLIANCE.md) |
+| **Callback / loopback** | Vortex-style loopback + PKCE (`http://127.0.0.1:<port>` for Nexus OAuth; Discord uses `voa://callback`) |
+| **Download architecture** | **User OAuth only** → `download_link.json` with **Bearer user token** → **direct Nexus CDN HTTPS**. No server personal `apikey`. No VOA rehost of Nexus files. |
+| **Headers** | `Application-Name: VisionsOfAetherius`, `Application-Version: <semver>` |
 
-Env placeholders: `NEXUS_API_KEY`, `NEXUS_APP_NAME` in `services/api/.env.example`.
+**There is no `NEXUS_API_KEY` production path.** See `services/api/src/nexus.ts` and `docs/NEXUS_COMPLIANCE.md`.
 
 ## Current iteration (high level)
 
@@ -74,19 +75,18 @@ Env placeholders: `NEXUS_API_KEY`, `NEXUS_APP_NAME` in `services/api/.env.exampl
 |------|--------|
 | Launcher + Discord OAuth + guild gate | Live |
 | SkyMP session / Play | Live |
-| CDN client (`skymp5-client.js`) | Live (chat v5, soft world cleaner) |
-| Server gamemode snippets (chat, console, player-only, interact) | On VPS |
-| CEF chat send path | Working (`net: emit`); on-screen list visibility still polishing |
-| Soft client NPC mute (no `disable()`) | Live |
-| Nexus catalog download helper | Code present; **app registration pending** |
-| Public hardened TLS | Pending |
+| CDN client (`skymp5-client.js`) | Live |
+| Nexus OAuth user-initiated direct download | **Enforced** (no personal key) |
+| HTTPS public API / CDN | **Enforced** in config + packaged launcher |
+| Signed launcher updates (sha256 + Ed25519) | **Enforced** |
+| Archive path validation (zip-slip) | **Enforced** |
+| No default production secrets | **Enforced** |
 
 ## VPS game server
 
-API / master default: `178.156.158.116:3100`  
-Game: `178.156.158.116:10000`  
-See `docs/` and `deploy/scripts/` for VPS ops (purge changeForms, snippets, client push).
+Game UDP: `178.156.158.116:10000`  
+Public HTTP API must be served as **HTTPS** (reverse proxy). See `docs/NEXUS_COMPLIANCE.md` §3.
 
 ## License / secrets
 
-Do **not** commit `.env`, API keys, or SSH keys. Use `.env.example` only.
+Do **not** commit `.env`, API keys, signing private keys, or SSH keys. Use `.env.example` only.

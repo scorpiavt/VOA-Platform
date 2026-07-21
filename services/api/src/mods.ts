@@ -38,10 +38,10 @@ export type NexusModMeta = {
 export type ModPackageMeta = LocalModMeta | NexusModMeta;
 
 /**
- * Catalog policy:
+ * Catalog policy (Nexus compliance — letter of the law):
  * - local: VOA first-party + non-Nexus redistributables (SKSE silverlock) under DATA_DIR/mod-packages
- * - nexus: launcher downloads via the user's Nexus browser OAuth login (Free/Premium) —
- *   NEVER rehosted or proxied through VOA for end users
+ * - nexus: ONLY path = user-initiated launcher OAuth → download_link with user Bearer token
+ *          → direct HTTPS CDN download. NEVER server personal apikey. NEVER VOA rehost of Nexus files.
  */
 const CATALOG: ModPackageMeta[] = [
   {
@@ -56,30 +56,41 @@ const CATALOG: ModPackageMeta[] = [
     tags: ["required", "skse", "runtime"],
   },
   {
-    id: "address-library-ae",
-    name: "Address Library for SKSE Plugins",
+    id: "voa-address-library",
+    name: "Address Library (AE 1.6.1170)",
     description:
-      "Required database for SKSE plugins (Engine Fixes, Crash Logger, etc.) on AE 1.6.1170. Downloaded from Nexus Mods after you log in with your Nexus account in the browser (Free or Premium) — not rehosted on VOA. Log in under Account before installing.",
-    version: "11",
-    source: "nexus",
-    nexusGame: "skyrimspecialedition",
-    nexusModId: 32444,
-    nexusFileId: 720756, // All in one (all game versions) v11
-    sizeHint: 5_302_930,
+      "Required versionlib database for SKSE plugins on Skyrim AE 1.6.1170 (versionlib-1-6-1170-0.bin). Hosted on VOA CDN so players do not need a Nexus login for multiplayer. Installs under Data/SKSE/Plugins.",
+    version: "1.6.1170",
+    source: "local",
+    filename: "voa-address-library-1.6.1170.zip",
     required: true,
-    tags: ["required", "skse", "address-library", "nexus"],
-    remapSkseToData: true,
+    tags: ["required", "skse", "address-library"],
   },
   {
     id: "voa-mp-core",
     name: "VOA Multiplayer Core",
     description:
-      "Required multiplayer client: matched Skyrim Platform AE + MpClientPlugin set (fixes error 126 and libnode Tick crash), skymp5-client, RuntimeDependencies, scripts, password. Uninstall removes only this package's files. Do not mix with Keizaal/other SP builds.",
-    version: "0.1.5",
+      "Required multiplayer client: Skyrim Platform AE 2.9.0 matched stack (SKSEPlugin_Version) + Impl/CEF + MpClientPlugin + skymp5-client. Official Plugins layout (fmt/spdlog only in RuntimeDependencies). Do not mix with Keizaal/other SP builds.",
+    version: "0.1.8",
     source: "local",
-    filename: "voa-mp-core-0.1.5.zip",
+    filename: "voa-mp-core-0.1.8.zip",
     required: true,
     tags: ["required", "multiplayer"],
+  },
+  {
+    id: "address-library-ae",
+    name: "Address Library (Nexus full pack, optional)",
+    description:
+      "Optional full Address Library All-in-One from Nexus. Not required if VOA Address Library (AE 1.6.1170) is installed. Needs Nexus login.",
+    version: "11",
+    source: "nexus",
+    nexusGame: "skyrimspecialedition",
+    nexusModId: 32444,
+    nexusFileId: 720756,
+    sizeHint: 5_302_930,
+    required: false,
+    tags: ["optional", "skse", "address-library", "nexus"],
+    remapSkseToData: true,
   },
   {
     id: "voa-base-assets",
@@ -111,14 +122,14 @@ export type PublicModPackage = {
   version: string;
   size: number;
   sha256: string;
-  /** Local VOA CDN URL; empty for nexus packages (client downloads via user key). */
+  /** Local VOA CDN URL; empty string for nexus packages (OAuth direct download only). */
   downloadUrl: string;
   required: boolean;
   tags: string[];
   installRoot: "skyrim";
   available: boolean;
   source: "local" | "nexus";
-  /** Present when source === "nexus" — launcher uses these with the user's API key. */
+  /** Present when source === "nexus" — launcher uses user OAuth (not personal API keys). */
   nexusGame?: string;
   nexusModId?: number;
   nexusFileId?: number;

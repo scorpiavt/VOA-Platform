@@ -14,7 +14,7 @@ import fs from "fs";
 import http from "http";
 import https from "https";
 import path from "path";
-import { spawn, execFile } from "child_process";
+import { spawn, execFile, execFileSync } from "child_process";
 import { URL, pathToFileURL } from "url";
 import { promisify } from "util";
 import {
@@ -22,6 +22,8 @@ import {
   ensureVoaInstance,
   isValidGameRoot,
   writeFileExclusive,
+  purgeBannedInstanceJunk,
+  pathLooksLikeProgramFiles,
   type InstanceProgress,
 } from "./voaInstance";
 
@@ -44,18 +46,55 @@ protocol.registerSchemesAsPrivileged([
   },
 ]);
 
-/** Official public platform API (players). Override with VOA_API_URL for local dev. */
-const PUBLIC_API_URL = "http://178.156.158.116:3100";
+/**
+ * Official public platform API (players). MUST be HTTPS (Nexus compliance §3).
+ * Override with VOA_API_URL for local dev (http://127.0.0.1 only).
+ */
+const PUBLIC_API_URL = "https://api.visionsofaetherius.com";
 const PUBLIC_GAME = {
   ip: "178.156.158.116",
   port: 10000,
   name: "Visions of Aetherius",
 } as const;
 
+/**
+ * Ed25519 public key (SPKI base64) for launcher update signatures.
+ * Matching private key is offline-only (VOA_UPDATE_SIGNING_KEY). Nexus compliance §4.
+ * Replace after `node scripts/sign-launcher-update.mjs --generate-keys`.
+ */
+const VOA_UPDATE_PUBLIC_KEY_B64 =
+  process.env.VOA_UPDATE_PUBLIC_KEY?.trim() ||
+  // Ed25519 SPKI (base64). Private key offline only — scripts/sign-launcher-update.mjs
+  "MCowBQYDK2VwAyEAqAPth5lpwCl3phkWjbyuRIWKhdc95z0knKVRoUrOlak=";
+
+function isLocalApiHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return h === "127.0.0.1" || h === "localhost" || h === "::1";
+}
+
+function assertPublicHttpsApiUrl(urlStr: string): string {
+  const base = urlStr.replace(/\/$/, "");
+  let u: URL;
+  try {
+    u = new URL(base);
+  } catch {
+    throw new Error(`Invalid VOA_API_URL: ${urlStr}`);
+  }
+  if (!isLocalApiHost(u.hostname) && u.protocol !== "https:") {
+    throw new Error(
+      `[VOA compliance] Public API URL must be HTTPS (got ${u.protocol}//${u.hostname}). ` +
+        `See docs/NEXUS_COMPLIANCE.md §3.`
+    );
+  }
+  return base;
+}
+
 function resolveApiBase(): string {
-  if (process.env.VOA_API_URL) return process.env.VOA_API_URL.replace(/\/$/, "");
-  // Packaged player builds always hit the official VPS — never a local monorepo API
-  if (app.isPackaged) return PUBLIC_API_URL;
+  if (process.env.VOA_API_URL) {
+    return assertPublicHttpsApiUrl(process.env.VOA_API_URL);
+  }
+  // Packaged player builds: HTTPS public API only
+  if (app.isPackaged) return assertPublicHttpsApiUrl(PUBLIC_API_URL);
   // Dev default: local API (run `npm run dev:api`)
   return "http://127.0.0.1:3100";
 }
@@ -290,18 +329,104 @@ function downloadTextFromApi(
 }
 
 /**
- * Known-good SkyrimPlatformImpl size for SP-AE pack used with 1.6.1170
- * (tmp-sp-ae-clean). Wrong size → REL/Relocation.h unexpected format.
+ * Canonical VOA Multiplayer Core sizes — must be installed as a matched set.
+ * Mixing SP dll from one pack with Impl from another → REL/Relocation.h "unexpected format"
+ * and a console that opens then dies instantly (SkyrimPlatformImpl.dll message box).
+ *
+ * Stack A (primary): AE SP 2.9.0 — SKSEPlugin_Version; proven on host (Paarthurnax).
+ * Stack B (legacy CDN): older Query export; SKSE often reports "no version data" / no console.
  */
-const SP_IMPL_GOOD_SIZE = 14801408;
+const VOA_SP_STACK = {
+  skyrimPlatformDll: 155_648,
+  mpClientDll: 812_032,
+  skyrimPlatformImpl: 14_801_408,
+} as const;
+
+/** Legacy CDN pack (0.1.6–0.1.7) — accept as matched so we do not thrash reinstall. */
+const SP_STACK_ALT = {
+  skyrimPlatformDll: 157_696,
+  mpClientDll: 812_032,
+  skyrimPlatformImpl: 14_579_200,
+} as const;
+
+function fileSizeOr0(p: string): number {
+  try {
+    return fs.existsSync(p) ? fs.statSync(p).size : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function spStackPaths(skyrim: string) {
+  return {
+    spDll: path.join(skyrim, "Data", "SKSE", "Plugins", "SkyrimPlatform.dll"),
+    mpDll: path.join(skyrim, "Data", "SKSE", "Plugins", "MpClientPlugin.dll"),
+    impl: path.join(
+      skyrim,
+      "Data",
+      "Platform",
+      "Distribution",
+      "RuntimeDependencies",
+      "SkyrimPlatformImpl.dll"
+    ),
+    versionlib: path.join(
+      skyrim,
+      "Data",
+      "SKSE",
+      "Plugins",
+      "versionlib-1-6-1170-0.bin"
+    ),
+  };
+}
+
+/** True only if SP + MpClient + Impl are a known matched triple (not mixed packs). */
+function isMatchedSpStack(skyrim: string): boolean {
+  const p = spStackPaths(skyrim);
+  const sp = fileSizeOr0(p.spDll);
+  const mp = fileSizeOr0(p.mpDll);
+  const impl = fileSizeOr0(p.impl);
+  if (!sp || !mp || !impl) return false;
+  const a = VOA_SP_STACK;
+  const b = SP_STACK_ALT;
+  const matchA =
+    sp === a.skyrimPlatformDll &&
+    mp === a.mpClientDll &&
+    impl === a.skyrimPlatformImpl;
+  const matchB =
+    sp === b.skyrimPlatformDll &&
+    mp === b.mpClientDll &&
+    impl === b.skyrimPlatformImpl;
+  return matchA || matchB;
+}
+
+/** Preferred CDN/host stack (A / 2.9.0 Version export). Legacy B still "matched" but we upgrade off it. */
+function isPreferredSpStack(skyrim: string): boolean {
+  const p = spStackPaths(skyrim);
+  const a = VOA_SP_STACK;
+  return (
+    fileSizeOr0(p.spDll) === a.skyrimPlatformDll &&
+    fileSizeOr0(p.mpDll) === a.mpClientDll &&
+    fileSizeOr0(p.impl) === a.skyrimPlatformImpl
+  );
+}
 
 /**
  * Lean SKSE stack for VOA: only SP + MpClient + Address Library 1170.
- * EngineFixes / CrashLogger / SkyPatcher etc. cause SP REL crashes on AE.
- * Also reinstall matched SkyrimPlatformImpl when size is wrong (hardlink rebuild pollution).
+ * Quarantine EngineFixes / CrashLogger / etc. (they cause SP REL crashes).
+ * Detect mismatched SP triples so Play can force-reinstall voa-mp-core.
  */
 function ensureLeanSpStack(skyrim: string): string[] {
   const cleaned: string[] = [];
+  // Keizaal _disabledByKzl / MO2 / cuprofiles — strip every Play (was re-hardlinked from source)
+  try {
+    const purged = purgeBannedInstanceJunk(skyrim);
+    if (purged.length) {
+      cleaned.push(...purged.map((p) => `purged:${p}`));
+      playLog(`purged banned junk: ${purged.join(", ")}`);
+    }
+  } catch (ePurge: any) {
+    playLog(`purgeBannedInstanceJunk err: ${ePurge?.message || ePurge}`);
+  }
   const plug = path.join(skyrim, "Data", "SKSE", "Plugins");
   try {
     fs.mkdirSync(plug, { recursive: true });
@@ -309,13 +434,13 @@ function ensureLeanSpStack(skyrim: string): string[] {
     return cleaned;
   }
 
+  // Official SP: only SkyrimPlatform + MpClient (+ Address Library bins) in Plugins.
+  // fmt/spdlog belong exclusively in RuntimeDependencies — quarantine if present.
   const keepExact = new Set(
     [
       "skyrimplatform.dll",
       "skyrimplatform.ini",
       "mpclientplugin.dll",
-      "spdlog.dll",
-      "fmt.dll",
       "versionlib-1-6-1170-0.bin",
       "versionlib-1-6-1170-0-1.bin",
       "version-1-6-1170-0.bin",
@@ -341,13 +466,11 @@ function ensureLeanSpStack(skyrim: string): string[] {
         continue;
       }
       if (nl.startsWith("version-1-6-1170")) continue;
-      // Keep already-disabled markers out of the way
       if (nl.includes("disabled") || nl.startsWith("_")) continue;
       try {
         fs.mkdirSync(quarantine, { recursive: true });
         const from = path.join(plug, n);
         const to = path.join(quarantine, n);
-        // Break hardlink
         try {
           fs.unlinkSync(to);
         } catch {
@@ -369,103 +492,66 @@ function ensureLeanSpStack(skyrim: string): string[] {
     /* ignore */
   }
 
-  // Fix mismatched Impl (common after full clone / Verify Files)
-  const impl = path.join(
-    skyrim,
-    "Data",
-    "Platform",
-    "Distribution",
-    "RuntimeDependencies",
-    "SkyrimPlatformImpl.dll"
-  );
-  let needImpl = true;
-  try {
-    if (fs.existsSync(impl) && fs.statSync(impl).size === SP_IMPL_GOOD_SIZE) {
-      needImpl = false;
-    }
-  } catch {
-    needImpl = true;
-  }
-  if (needImpl) {
-    const candidates = [
-      // Dev monorepo packs
-      path.resolve(
-        __dirname,
-        "../../../tmp-sp-ae-clean/Platform/Distribution/RuntimeDependencies/SkyrimPlatformImpl.dll"
-      ),
-      path.resolve(
-        __dirname,
-        "../../../tmp-sp-ae/Platform/Distribution/RuntimeDependencies/SkyrimPlatformImpl.dll"
-      ),
-      path.resolve(
-        process.cwd(),
-        "tmp-sp-ae-clean/Platform/Distribution/RuntimeDependencies/SkyrimPlatformImpl.dll"
-      ),
-      path.join(
-        app.getPath("userData"),
-        "sp-ae",
-        "SkyrimPlatformImpl.dll"
-      ),
-    ];
-    for (const c of candidates) {
-      try {
-        if (!fs.existsSync(c)) continue;
-        if (fs.statSync(c).size !== SP_IMPL_GOOD_SIZE) continue;
-        fs.mkdirSync(path.dirname(impl), { recursive: true });
-        try {
-          fs.unlinkSync(impl);
-        } catch {
-          /* ignore */
-        }
-        fs.copyFileSync(c, impl);
-        cleaned.push("SkyrimPlatformImpl.dll (matched pack restored)");
-        needImpl = false;
-        break;
-      } catch {
-        /* try next */
-      }
-    }
-    if (needImpl) {
-      cleaned.push(
-        "WARN: SkyrimPlatformImpl.dll size mismatch — reinstall multiplayer/SP package"
-      );
-    }
+  const paths = spStackPaths(skyrim);
+  const spSz = fileSizeOr0(paths.spDll);
+  const mpSz = fileSizeOr0(paths.mpDll);
+  const implSz = fileSizeOr0(paths.impl);
+
+  if (!isMatchedSpStack(skyrim)) {
+    cleaned.push(
+      `WARN: SP stack mismatch or incomplete (sp=${spSz} mp=${mpSz} impl=${implSz}) — need VOA Multiplayer Core reinstall`
+    );
+    playLog(
+      `sp-stack mismatch sp=${spSz} mp=${mpSz} impl=${implSz} (want ${VOA_SP_STACK.skyrimPlatformDll}/${VOA_SP_STACK.mpClientDll}/${VOA_SP_STACK.skyrimPlatformImpl})`
+    );
   }
 
-  // SP + MpClient from monorepo pack if present and missing
-  const spDll = path.join(plug, "SkyrimPlatform.dll");
-  const mpDll = path.join(plug, "MpClientPlugin.dll");
+  // Dev monorepo: restore a full matched pack when present
   const packRoots = [
-    path.resolve(__dirname, "../../../tmp-sp-ae-clean"),
-    path.resolve(__dirname, "../../../tmp-sp-ae"),
+    {
+      root: path.resolve(__dirname, "../../../tmp-sp-ae"),
+      expect: VOA_SP_STACK,
+    },
+    {
+      root: path.resolve(__dirname, "../../../tmp-sp-ae-clean"),
+      expect: VOA_SP_STACK,
+    },
+    {
+      root: path.resolve(__dirname, "../../../tmp-sp29"),
+      expect: SP_STACK_ALT,
+    },
   ];
-  for (const root of packRoots) {
-    const spSrc = path.join(root, "SKSE", "Plugins", "SkyrimPlatform.dll");
-    const mpSrc = path.join(root, "SKSE", "Plugins", "MpClientPlugin.dll");
-    try {
-      if (fs.existsSync(spSrc) && (!fs.existsSync(spDll) || fs.statSync(spDll).size !== fs.statSync(spSrc).size)) {
-        try {
-          fs.unlinkSync(spDll);
-        } catch {
-          /* ignore */
-        }
-        fs.copyFileSync(spSrc, spDll);
-        cleaned.push("SkyrimPlatform.dll (restored)");
-      }
-      if (fs.existsSync(mpSrc) && !fs.existsSync(mpDll)) {
-        fs.copyFileSync(mpSrc, mpDll);
-        cleaned.push("MpClientPlugin.dll (restored)");
-      }
-      // Full RuntimeDependencies if Impl was restored from this pack
-      const rdSrc = path.join(root, "Platform", "Distribution", "RuntimeDependencies");
-      const rdDst = path.join(
-        skyrim,
-        "Data",
+  if (!isMatchedSpStack(skyrim)) {
+    for (const { root, expect } of packRoots) {
+      const spSrc = path.join(root, "SKSE", "Plugins", "SkyrimPlatform.dll");
+      const mpSrc = path.join(root, "SKSE", "Plugins", "MpClientPlugin.dll");
+      const implSrc = path.join(
+        root,
         "Platform",
         "Distribution",
-        "RuntimeDependencies"
+        "RuntimeDependencies",
+        "SkyrimPlatformImpl.dll"
       );
-      if (fs.existsSync(rdSrc) && fs.existsSync(path.join(rdSrc, "SkyrimPlatformImpl.dll"))) {
+      try {
+        if (!fs.existsSync(spSrc) || !fs.existsSync(mpSrc) || !fs.existsSync(implSrc)) {
+          continue;
+        }
+        if (fs.statSync(spSrc).size !== expect.skyrimPlatformDll) continue;
+        if (fs.statSync(implSrc).size !== expect.skyrimPlatformImpl) continue;
+        for (const [from, to] of [
+          [spSrc, paths.spDll],
+          [mpSrc, paths.mpDll],
+        ] as const) {
+          fs.mkdirSync(path.dirname(to), { recursive: true });
+          try {
+            fs.unlinkSync(to);
+          } catch {
+            /* ignore */
+          }
+          fs.copyFileSync(from, to);
+        }
+        const rdSrc = path.join(root, "Platform", "Distribution", "RuntimeDependencies");
+        const rdDst = path.dirname(paths.impl);
         fs.mkdirSync(rdDst, { recursive: true });
         for (const f of fs.readdirSync(rdSrc)) {
           const from = path.join(rdSrc, f);
@@ -482,14 +568,172 @@ function ensureLeanSpStack(skyrim: string): string[] {
             /* ignore */
           }
         }
+        cleaned.push(`SP stack restored from ${path.basename(root)}`);
+        playLog(`sp-stack restored from ${root}`);
+        break;
+      } catch (e: any) {
+        playLog(`sp-stack restore fail ${root}: ${e?.message || e}`);
       }
-      break;
-    } catch {
-      /* try next pack */
     }
   }
 
   return cleaned;
+}
+
+/** True if RuntimeDependencies + CEF look like a complete SP AE pack (not half-copied). */
+function hasCompleteRuntimeDeps(skyrim: string): boolean {
+  const rd = path.join(
+    skyrim,
+    "Data",
+    "Platform",
+    "Distribution",
+    "RuntimeDependencies"
+  );
+  const need = [
+    "SkyrimPlatformImpl.dll",
+    "libcef.dll",
+    "ChakraCore.dll",
+    "spdlog.dll",
+    "fmt.dll",
+  ];
+  for (const n of need) {
+    if (!fs.existsSync(path.join(rd, n))) return false;
+  }
+  // CEF resource paks — without these SP often dies before the debug console appears
+  const cefPak = path.join(
+    skyrim,
+    "Data",
+    "Platform",
+    "Distribution",
+    "CEF",
+    "resources.pak"
+  );
+  if (!fs.existsSync(cefPak)) return false;
+  try {
+    if (fs.statSync(cefPak).size < 1_000_000) return false;
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/** True if Play should force-download voa-mp-core again (missing, mismatched, legacy B, or incomplete). */
+function needsVoaMpCoreReinstall(skyrim: string): boolean {
+  // Prefer stack A only — legacy CDN stack B often fails SKSE load (no SP console).
+  if (!isPreferredSpStack(skyrim)) return true;
+  if (!hasCompleteRuntimeDeps(skyrim)) return true;
+  return false;
+}
+
+/**
+ * SKSE ships Papyrus overrides under Data/Scripts (Actor.pex, Form.pex, …).
+ * Skyrim Platform hard-requires a subset; without them SP logs
+ * "[Exception] Missing files: Actor.pex …" and papyrus hooks break.
+ */
+function hasSksePapyrusScripts(skyrim: string): boolean {
+  const dir = path.join(skyrim, "Data", "Scripts");
+  // Sentinels from SKSE AE 2.2.6 + SP missing-files list
+  const need = [
+    "Actor.pex",
+    "ActorBase.pex",
+    "Form.pex",
+    "ObjectReference.pex",
+    "Cell.pex",
+    "Race.pex",
+    "skse.pex",
+  ];
+  for (const n of need) {
+    if (!fs.existsSync(path.join(dir, n))) return false;
+  }
+  return true;
+}
+
+/** Break hardlinks / locked targets before writing package files. */
+function copyBreakHardlink(from: string, to: string): void {
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  const tmp = `${to}.voa-new-${process.pid}`;
+  try {
+    fs.copyFileSync(from, tmp);
+    try {
+      fs.unlinkSync(to);
+    } catch {
+      /* may not exist */
+    }
+    fs.renameSync(tmp, to);
+  } finally {
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Delete mismatched SP binaries so reinstall cannot merge with hardlinked junk.
+ */
+function wipeVoaMpCoreFiles(skyrim: string): void {
+  const p = spStackPaths(skyrim);
+  const extra = [
+    p.spDll,
+    p.mpDll,
+    p.impl,
+    path.join(skyrim, "Data", "SKSE", "Plugins", "fmt.dll"),
+    path.join(skyrim, "Data", "SKSE", "Plugins", "spdlog.dll"),
+    path.join(skyrim, "Data", "SKSE", "Plugins", "SkyrimPlatform.ini"),
+  ];
+  for (const f of extra) {
+    try {
+      if (fs.existsSync(f)) fs.unlinkSync(f);
+    } catch (e: any) {
+      playLog(`wipe fail ${f}: ${e?.message || e}`);
+    }
+  }
+  // Clear RuntimeDependencies entirely (will be refilled by voa-mp-core)
+  const rd = path.join(
+    skyrim,
+    "Data",
+    "Platform",
+    "Distribution",
+    "RuntimeDependencies"
+  );
+  try {
+    if (fs.existsSync(rd)) {
+      for (const ent of fs.readdirSync(rd, { withFileTypes: true })) {
+        if (!ent.isFile()) continue;
+        try {
+          fs.unlinkSync(path.join(rd, ent.name));
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  } catch (e: any) {
+    playLog(`wipe RD fail: ${e?.message || e}`);
+  }
+  playLog("wiped SP stack files before voa-mp-core reinstall");
+}
+
+/** Skyrim AE multiplayer target: 1.6.1170.x */
+function getSkyrimExeVersion(skyrim: string): string | null {
+  try {
+    const exe = path.join(skyrim, "SkyrimSE.exe");
+    if (!fs.existsSync(exe)) return null;
+    // PowerShell FileVersionInfo is reliable on Windows
+    const out = execFileSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `(Get-Item -LiteralPath '${exe.replace(/'/g, "''")}').VersionInfo.FileVersion`,
+      ],
+      { windowsHide: true, timeout: 8000, encoding: "utf8" }
+    );
+    return String(out || "").trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -629,9 +873,10 @@ async function installVoaGameFiles(
           "LogLevel = 0",
           "Cmd = true",
           "CmdOffsetLeft = 0",
-          "CmdOffsetTop = 600",
-          "CmdWidth = 900",
-          "CmdHeight = 350",
+          // Large, low on screen so friends see Hello Multiplayer (was easy to miss at 600/900x350)
+          "CmdOffsetTop = 400",
+          "CmdWidth = 1400",
+          "CmdHeight = 450",
           "CmdIsAlwaysOnTop = false",
           // CEF ON — required for VOA chat box, radial menu, announce popup overlays
           // (lean matched SP stack; keep false only if Chromium crashes on your machine)
@@ -697,6 +942,101 @@ function playLog(line: string): void {
   }
 }
 
+/** True if path is under OneDrive (cloud) — VOA must never use these. */
+function isOneDrivePath(p: string | null | undefined): boolean {
+  if (!p) return false;
+  let n = String(p).replace(/\\/g, "/").toLowerCase();
+  if (
+    n.includes("/onedrive") ||
+    n.includes("onedrive -") ||
+    n.includes("onedrive/") ||
+    n.startsWith("onedrive")
+  ) {
+    return true;
+  }
+  try {
+    const real = fs.realpathSync(p);
+    n = real.replace(/\\/g, "/").toLowerCase();
+    if (n.includes("onedrive")) return true;
+  } catch {
+    /* path may not exist yet */
+  }
+  for (const key of ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]) {
+    const od = process.env[key];
+    if (!od) continue;
+    const odn = od.replace(/\\/g, "/").toLowerCase().replace(/\/$/, "");
+    if (odn && n.startsWith(odn)) return true;
+  }
+  return false;
+}
+
+/**
+ * Local Documents root that is NEVER OneDrive.
+ * Prefer %USERPROFILE%\Documents only if not redirected; else LocalAppData VOA.
+ */
+function getLocalDocumentsPath(): string {
+  const tryPath = (p: string): string | null => {
+    if (!p || isOneDrivePath(p)) return null;
+    try {
+      fs.mkdirSync(p, { recursive: true });
+      return p;
+    } catch {
+      return null;
+    }
+  };
+
+  // Explicit local profile Documents (reject if junction → OneDrive)
+  if (process.env.USERPROFILE) {
+    const d = tryPath(path.join(process.env.USERPROFILE, "Documents"));
+    if (d) return d;
+  }
+
+  try {
+    const docs = app.getPath("documents");
+    const d = tryPath(docs);
+    if (d) return d;
+  } catch {
+    /* ignore */
+  }
+
+  // Guaranteed local: next to launcher userData (AppData\Roaming\... is not OneDrive)
+  const fallback = path.join(app.getPath("userData"), "Documents");
+  fs.mkdirSync(fallback, { recursive: true });
+  playLog(`documents using local fallback (OneDrive blocked): ${fallback}`);
+  return fallback;
+}
+
+/** My Games / Skyrim SE roots to use (never OneDrive). */
+function getLocalSkyrimMyGamesDirs(): string[] {
+  const out: string[] = [];
+  const add = (p: string) => {
+    if (!p || isOneDrivePath(p)) return;
+    if (!out.some((x) => x.toLowerCase() === p.toLowerCase())) out.push(p);
+  };
+  add(path.join(getLocalDocumentsPath(), "My Games", "Skyrim Special Edition"));
+  add(
+    path.join(app.getPath("userData"), "My Games", "Skyrim Special Edition")
+  );
+  if (process.env.LOCALAPPDATA) {
+    add(
+      path.join(
+        process.env.LOCALAPPDATA,
+        "VOA",
+        "My Games",
+        "Skyrim Special Edition"
+      )
+    );
+  }
+  return out;
+}
+
+function rejectOneDrivePath(p: string, what: string): string | null {
+  if (isOneDrivePath(p)) {
+    return `${what} cannot be on OneDrive (${p}). Use a local disk path only (e.g. Steam under Program Files or a local drive). Disable OneDrive "Backup Documents" if needed.`;
+  }
+  return null;
+}
+
 /** True if a process with this image name is running (Windows). */
 function isProcessRunning(imageName: string): Promise<boolean> {
   return new Promise((resolve) => {
@@ -733,11 +1073,116 @@ async function waitForGameProcess(timeoutMs = 12_000): Promise<{
   return { seen: false };
 }
 
+/** Clear Mark-of-the-Web so Windows does not silently block skse64_loader / SP DLLs. */
+function unblockWindowsFile(filePath: string): void {
+  try {
+    if (process.platform !== "win32" || !fs.existsSync(filePath)) return;
+    const zone = `${filePath}:Zone.Identifier`;
+    try {
+      fs.unlinkSync(zone);
+    } catch {
+      /* no zone stream */
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * CDN zip extracts often keep MOTW on every .dll under Data/Platform.
+ * Unblock the whole VOA tree — LoadLibrary of SkyrimPlatformImpl/libcef fails
+ * silently otherwise (vanilla menu, no skyrim-platform.log).
+ */
+function unblockWindowsGameTree(gameDir: string): void {
+  if (process.platform !== "win32" || !gameDir || !fs.existsSync(gameDir)) return;
+  const roots = [
+    gameDir,
+    path.join(gameDir, "Data", "SKSE"),
+    path.join(gameDir, "Data", "Platform"),
+  ];
+  for (const root of roots) {
+    if (!fs.existsSync(root)) continue;
+    try {
+      const lit = root.replace(/'/g, "''");
+      execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          `Get-ChildItem -LiteralPath '${lit}' -Recurse -File -ErrorAction SilentlyContinue | Where-Object { $_.Extension -match '\\.(dll|exe|bin|pak)$' } | Unblock-File -ErrorAction SilentlyContinue`,
+        ],
+        { windowsHide: true, timeout: 90_000 }
+      );
+    } catch (e: any) {
+      playLog(`Unblock-File tree fail ${root}: ${e?.message || e}`);
+    }
+  }
+  // Also strip Zone.Identifier on the critical load path (PS may miss some)
+  const critical = [
+    path.join(gameDir, "skse64_loader.exe"),
+    path.join(gameDir, "skse64_1_6_1170.dll"),
+    path.join(gameDir, "Data", "SKSE", "Plugins", "SkyrimPlatform.dll"),
+    path.join(gameDir, "Data", "SKSE", "Plugins", "MpClientPlugin.dll"),
+    path.join(
+      gameDir,
+      "Data",
+      "Platform",
+      "Distribution",
+      "RuntimeDependencies",
+      "SkyrimPlatformImpl.dll"
+    ),
+    path.join(
+      gameDir,
+      "Data",
+      "Platform",
+      "Distribution",
+      "RuntimeDependencies",
+      "libcef.dll"
+    ),
+    path.join(
+      gameDir,
+      "Data",
+      "Platform",
+      "Distribution",
+      "RuntimeDependencies",
+      "ChakraCore.dll"
+    ),
+  ];
+  for (const f of critical) unblockWindowsFile(f);
+}
+
+/**
+ * Force-close Skyrim / SKSE so Play can start a clean skse64_loader session.
+ * Vanilla Steam SkyrimSE without SKSE must not be treated as a successful Play.
+ */
+async function stopSkyrimProcesses(): Promise<void> {
+  if (process.platform !== "win32") return;
+  const images = ["SkyrimSE.exe", "skse64_loader.exe", "SkyrimSELauncher.exe"];
+  for (const img of images) {
+    try {
+      await execFileAsync("taskkill", ["/F", "/IM", img, "/T"], {
+        windowsHide: true,
+        timeout: 12_000,
+      });
+      playLog(`taskkill ${img} ok`);
+    } catch {
+      /* not running or access denied */
+    }
+  }
+  // Brief settle so Steam/handles release the exe
+  await new Promise((r) => setTimeout(r, 800));
+}
+
 /**
  * Start skse64_loader.exe with the Skyrim install as process working directory.
  * Address Library opens Data/SKSE/Plugins/versionlib-*.bin relative to CWD.
- * Primary: spawn loader directly with cwd (most reliable).
- * Fallback: cmd start /D. Verifies a game process appears or returns an error.
+ *
+ * NEVER launches bare SkyrimSE.exe.
+ * NEVER treats an already-running vanilla Skyrim as success (that was a bug —
+ * friends saw "Game started" with no SKSE / no SP console).
  */
 async function launchSkseMultiplayer(
   skyrim: string,
@@ -756,16 +1201,62 @@ async function launchSkseMultiplayer(
 
   playLog(`launch begin dir=${gameDir} loader=${loaderPath}`);
 
-  const alreadyRunning = await isProcessRunning("SkyrimSE.exe");
-  if (alreadyRunning) {
-    playLog("SkyrimSE.exe already running — treating as success");
-    return {
-      ok: true,
-      method: "already-running",
-    };
+  // If Skyrim is already open (often from Steam without SKSE), close it first.
+  if (
+    (await isProcessRunning("SkyrimSE.exe")) ||
+    (await isProcessRunning("skse64_loader.exe"))
+  ) {
+    playLog("game already running — stopping so SKSE can start cleanly");
+    await stopSkyrimProcesses();
+    if (await isProcessRunning("SkyrimSE.exe")) {
+      return {
+        ok: false,
+        error:
+          "Skyrim is already running and could not be closed. Exit Skyrim completely (check Task Manager for SkyrimSE.exe), then press Play again. Do not start Skyrim from Steam.",
+      };
+    }
   }
 
-  // --- Primary: direct spawn with CWD = game root (matches successful manual Start-Process) ---
+  // Unblock loader + full SP/SKSE tree (CDN extracts keep MOTW; PF copies worse)
+  unblockWindowsGameTree(gameDir);
+
+  // Ensure steam_appid for non-Steam launches
+  try {
+    writeFileExclusive(path.join(gameDir, "steam_appid.txt"), "489830", "utf8");
+  } catch {
+    /* ignore */
+  }
+
+  const qPs = (p: string) => `'${p.replace(/'/g, "''")}'`;
+  const qCmd = (p: string) => `"${p.replace(/"/g, '""')}"`;
+
+  // --- 1) PowerShell Start-Process (most reliable cwd + Program Files) ---
+  try {
+    const ps = [
+      "Start-Process",
+      "-FilePath",
+      qPs(loaderPath),
+      "-WorkingDirectory",
+      qPs(gameDir),
+    ].join(" ");
+    playLog(`try powershell: ${ps}`);
+    await execFileAsync(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+      { windowsHide: true, timeout: 15_000, cwd: gameDir }
+    );
+    playLog("spawned skse64_loader (powershell Start-Process)");
+    const check = await waitForGameProcess(14_000);
+    if (check.seen) {
+      playLog(`ok powershell process=${check.which}`);
+      return { ok: true, method: "powershell-start" };
+    }
+    playLog("powershell: no Skyrim/SKSE process within 14s");
+  } catch (e: any) {
+    playLog(`powershell error: ${e?.message || e}`);
+  }
+
+  // --- 2) Direct spawn with CWD = game root ---
   try {
     const child = spawn(loaderPath, [], {
       cwd: gameDir,
@@ -774,27 +1265,27 @@ async function launchSkseMultiplayer(
       windowsHide: false,
       env: { ...process.env },
     });
+    const pid = child.pid;
     await new Promise<void>((resolve, reject) => {
       child.once("error", reject);
-      // Give spawn a tick to fail on ENOENT etc.
-      setTimeout(resolve, 200);
+      setTimeout(resolve, 300);
     });
     child.unref();
-    playLog("spawned skse64_loader (direct)");
-    const check = await waitForGameProcess(10_000);
+    playLog(`spawned skse64_loader (direct) pid=${pid ?? "?"}`);
+    const check = await waitForGameProcess(12_000);
     if (check.seen) {
       playLog(`ok direct process=${check.which}`);
       return { ok: true, method: "spawn-cwd" };
     }
-    playLog("direct spawn: no Skyrim/SKSE process within 10s — trying start /D fallback");
+    playLog("direct spawn: no process within 12s");
   } catch (e: any) {
     playLog(`direct spawn error: ${e?.message || e}`);
   }
 
-  // --- Fallback: cmd start /D (forces working directory for some Windows setups) ---
+  // --- 3) cmd start /D ---
   try {
-    const q = (p: string) => `"${p.replace(/"/g, '""')}"`;
-    const cmdLine = `start "" /D ${q(gameDir)} ${q(loaderPath)}`;
+    const cmdLine = `start "" /D ${qCmd(gameDir)} ${qCmd(loaderPath)}`;
+    playLog(`try cmd: ${cmdLine}`);
     const child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/c", cmdLine], {
       cwd: gameDir,
       detached: true,
@@ -803,30 +1294,59 @@ async function launchSkseMultiplayer(
     });
     await new Promise<void>((resolve, reject) => {
       child.once("error", reject);
-      setTimeout(resolve, 200);
+      setTimeout(resolve, 300);
     });
     child.unref();
     playLog("spawned via cmd start /D");
-    const check = await waitForGameProcess(10_000);
+    const check = await waitForGameProcess(12_000);
     if (check.seen) {
       playLog(`ok start/D process=${check.which}`);
       return { ok: true, method: "start-d" };
     }
-    playLog("start /D: no process within 10s");
+    playLog("start /D: no process within 12s");
   } catch (e: any) {
     playLog(`start /D error: ${e?.message || e}`);
+  }
+
+  // --- 4) Helper .bat in game dir (last resort; same as double-clicking loader) ---
+  try {
+    const bat = path.join(gameDir, "_voa_launch_skse.bat");
+    const batBody =
+      "@echo off\r\n" +
+      `cd /d ${qCmd(gameDir)}\r\n` +
+      `start "" ${qCmd(loaderPath)}\r\n`;
+    writeFileExclusive(bat, batBody, "utf8");
+    playLog(`try bat: ${bat}`);
+    const child = spawn(process.env.ComSpec || "cmd.exe", ["/d", "/c", qCmd(bat)], {
+      cwd: gameDir,
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      setTimeout(resolve, 400);
+    });
+    child.unref();
+    const check = await waitForGameProcess(12_000);
+    if (check.seen) {
+      playLog(`ok bat process=${check.which}`);
+      return { ok: true, method: "bat" };
+    }
+    playLog("bat: no process within 12s");
+  } catch (e: any) {
+    playLog(`bat error: ${e?.message || e}`);
   }
 
   return {
     ok: false,
     error:
-      "SKSE did not start (no SkyrimSE.exe / skse64_loader window). " +
-      "Check: Steam is running and you own Skyrim SE; antivirus is not blocking skse64_loader.exe; " +
-      "SKSE 2.2.6 is installed in the Skyrim folder; Settings → Skyrim path is correct. " +
-      `Log: ${path.join(app.getPath("userData"), "voa-play.log")}`,
+      "skse64_loader.exe did not start. Close Skyrim completely, keep Steam running, " +
+      "then try: (1) Play again, or (2) double-click skse64_loader.exe in the VOA game folder. " +
+      "If Windows/antivirus blocks it, allow the file. " +
+      `Folder: ${gameDir}. Log: ${path.join(app.getPath("userData"), "voa-play.log")}`,
   };
 }
-
 const storePath = () => path.join(app.getPath("userData"), "voa-store.json");
 
 type NexusUserInfo = {
@@ -973,6 +1493,7 @@ function detectSkyrimPath(): string | null {
     "D:\\Steam\\steamapps\\common\\Skyrim Special Edition",
   ];
   for (const c of candidates) {
+    if (isOneDrivePath(c)) continue;
     if (fs.existsSync(path.join(c, "SkyrimSE.exe"))) return c;
   }
   return null;
@@ -980,7 +1501,14 @@ function detectSkyrimPath(): string | null {
 
 function getSourceSkyrimPath(): string | null {
   const s = readStore();
-  if (s.skyrimPath && isValidGameRoot(s.skyrimPath)) return path.resolve(s.skyrimPath);
+  if (s.skyrimPath && isValidGameRoot(s.skyrimPath)) {
+    const resolved = path.resolve(s.skyrimPath);
+    if (isOneDrivePath(resolved)) {
+      playLog(`BLOCKED OneDrive skyrimPath: ${resolved}`);
+      return null;
+    }
+    return resolved;
+  }
   const detected = detectSkyrimPath();
   return detected ? path.resolve(detected) : null;
 }
@@ -1014,7 +1542,14 @@ function resolvePlayableSkyrim(opts?: {
     return {
       ok: false,
       error:
-        "Base Skyrim folder not set. In Settings, Browse to your Steam Skyrim Special Edition folder (the one with SkyrimSE.exe).",
+        "Base Skyrim folder not set (or was on OneDrive). In Settings, Browse to your local Steam Skyrim Special Edition folder (SkyrimSE.exe). OneDrive paths are not allowed.",
+    };
+  }
+  if (isOneDrivePath(source)) {
+    return {
+      ok: false,
+      error:
+        "Skyrim path is on OneDrive. Move/install Skyrim on a local disk (Steam library) and set that path in Settings.",
     };
   }
   const store = readStore();
@@ -1023,16 +1558,31 @@ function resolvePlayableSkyrim(opts?: {
     return { ok: true, path: source, sourcePath: source, usingInstance: false };
   }
 
-  const instancePath =
+  const userData = app.getPath("userData");
+  let instancePath =
     store.voaInstancePath &&
     path.resolve(store.voaInstancePath).toLowerCase() !== source.toLowerCase()
       ? path.resolve(store.voaInstancePath)
-      : defaultInstancePath(source, app.getPath("userData"));
+      : defaultInstancePath(source, userData);
+  // Never put VOA instance on OneDrive or under Program Files (friends' Steam default)
+  if (isOneDrivePath(instancePath) || pathLooksLikeProgramFiles(instancePath)) {
+    const movedFrom = instancePath;
+    instancePath = defaultInstancePath(source, userData);
+    // If default still unsafe (edge case), force userData Game folder
+    if (isOneDrivePath(instancePath) || pathLooksLikeProgramFiles(instancePath)) {
+      instancePath = path.join(userData, "Game", "Skyrim Special Edition - VOA");
+    }
+    playLog(
+      `instance path unsafe (${movedFrom}) — migrating to ${instancePath}`
+    );
+    // Force rebuild into the writable location so we do not reuse a half-broken PF tree
+    opts = { ...opts, forceRebuild: true };
+  }
 
   const res = ensureVoaInstance({
     sourcePath: source,
     instancePath,
-    userData: app.getPath("userData"),
+    userData,
     force: Boolean(opts?.forceRebuild),
     // Multiplayer-safe: vanilla DLC + SKSE essentials only (no full modlist clone)
     mode: "lean",
@@ -1860,13 +2410,131 @@ function cmpSemver(a: string, b: string): number {
 type LauncherUpdateInfo = {
   version: string;
   downloadUrl: string;
-  sha256?: string;
+  /** Required — SHA-256 hex of artifact (Nexus §4) */
+  sha256: string;
+  /** Required — Ed25519 signature base64 (Nexus §4) */
+  signature: string;
   size?: number;
   notes?: string;
   minVersion?: string;
   channel?: string;
   format?: "portable" | "zip";
 };
+
+function canonicalUpdateSignPayload(info: {
+  version: string;
+  downloadUrl: string;
+  sha256: string;
+  size?: number;
+  format?: string;
+}): string {
+  return [
+    "voa-launcher-update-v1",
+    info.version,
+    info.downloadUrl,
+    info.sha256.toLowerCase(),
+    String(info.size ?? ""),
+    info.format || "zip",
+  ].join("\n");
+}
+
+function verifyLauncherUpdateSignature(latest: LauncherUpdateInfo): void {
+  const sha = String(latest.sha256 || "").trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(sha)) {
+    throw new Error(
+      "[VOA compliance] Update manifest missing required sha256 (64-char hex)"
+    );
+  }
+  const sig = String(latest.signature || "").trim();
+  if (!sig || sig === "UNSIGNED-DEV-ONLY") {
+    throw new Error(
+      "[VOA compliance] Update manifest missing required Ed25519 signature"
+    );
+  }
+  if (
+    !VOA_UPDATE_PUBLIC_KEY_B64 ||
+    VOA_UPDATE_PUBLIC_KEY_B64.startsWith("REPLACE_WITH_")
+  ) {
+    throw new Error(
+      "[VOA compliance] Launcher build has no update public key embedded — refuse update"
+    );
+  }
+  let u: URL;
+  try {
+    u = new URL(latest.downloadUrl);
+  } catch {
+    throw new Error("[VOA compliance] Update downloadUrl is invalid");
+  }
+  if (u.protocol !== "https:" && !isLocalApiHost(u.hostname)) {
+    throw new Error("[VOA compliance] Update downloadUrl must be HTTPS");
+  }
+  const payload = canonicalUpdateSignPayload({
+    version: latest.version,
+    downloadUrl: latest.downloadUrl,
+    sha256: sha,
+    size: latest.size,
+    format: latest.format,
+  });
+  try {
+    const key = crypto.createPublicKey({
+      key: Buffer.from(VOA_UPDATE_PUBLIC_KEY_B64, "base64"),
+      format: "der",
+      type: "spki",
+    });
+    const ok = crypto.verify(
+      null,
+      Buffer.from(payload, "utf8"),
+      key,
+      Buffer.from(sig, "base64")
+    );
+    if (!ok) {
+      throw new Error("[VOA compliance] Update signature verification failed");
+    }
+  } catch (e: any) {
+    if (String(e?.message || e).includes("VOA compliance")) throw e;
+    throw new Error(
+      `[VOA compliance] Update signature verification error: ${e?.message || e}`
+    );
+  }
+}
+
+/**
+ * Zip-slip / path traversal guard (Nexus §6).
+ * Returns normalized relative path using forward slashes for storage.
+ */
+function assertSafeArchiveRelPath(relRaw: string, installRoot: string): string {
+  const rel = String(relRaw || "").replace(/\\/g, "/");
+  if (!rel || rel === ".") {
+    throw new Error("[VOA compliance] Empty archive path rejected");
+  }
+  if (rel.includes("\0")) {
+    throw new Error("[VOA compliance] NUL in archive path rejected");
+  }
+  if (path.isAbsolute(rel) || path.win32.isAbsolute(rel) || /^[a-zA-Z]:/.test(rel)) {
+    throw new Error(`[VOA compliance] Absolute archive path rejected: ${rel}`);
+  }
+  const parts = rel.split("/").filter((p) => p.length > 0);
+  if (parts.some((p) => p === ".." || p === ".")) {
+    throw new Error(`[VOA compliance] Path traversal rejected: ${rel}`);
+  }
+  const destAbs = path.resolve(installRoot, ...parts);
+  const rootAbs = path.resolve(installRoot);
+  const rootPrefix = rootAbs.endsWith(path.sep) ? rootAbs : rootAbs + path.sep;
+  if (destAbs !== rootAbs && !destAbs.startsWith(rootPrefix)) {
+    throw new Error(`[VOA compliance] Path escapes install root: ${rel}`);
+  }
+  return parts.join("/");
+}
+
+/** Validate every file under extractDir stays under installRoot when mapped. */
+function validateExtractedTree(extractDir: string, installRoot: string): string[] {
+  const staged = listFilesRecursive(extractDir);
+  const safe: string[] = [];
+  for (const rel of staged) {
+    safe.push(assertSafeArchiveRelPath(rel, installRoot));
+  }
+  return safe;
+}
 
 function emitLauncherUpdateProgress(payload: {
   phase: string;
@@ -1905,6 +2573,17 @@ ipcMain.handle("voa:checkLauncherUpdate", async () => {
       };
     }
     const latest = res.data;
+    // Nexus §4 — never surface an unsigned update as available
+    try {
+      verifyLauncherUpdateSignature(latest);
+    } catch (e: any) {
+      return {
+        currentVersion,
+        updateAvailable: false,
+        error: e?.message || String(e),
+        latest: null,
+      };
+    }
     const behindLatest = cmpSemver(currentVersion, latest.version) < 0;
     const belowMin =
       Boolean(latest.minVersion) &&
@@ -1943,6 +2622,12 @@ ipcMain.handle("voa:applyLauncherUpdate", async () => {
       return { ok: false, error: res.raw || "No update available" };
     }
     const latest = res.data;
+    // Nexus §4 — refuse unsigned / unhashed manifests (no optional path)
+    try {
+      verifyLauncherUpdateSignature(latest);
+    } catch (e: any) {
+      return { ok: false, error: e?.message || String(e) };
+    }
     const currentVersion = app.getVersion();
     if (cmpSemver(currentVersion, latest.version) >= 0) {
       return { ok: false, error: "Already up to date" };
@@ -1975,10 +2660,10 @@ ipcMain.handle("voa:applyLauncherUpdate", async () => {
       latest.size
     );
 
-    if (latest.sha256 && sha256.toLowerCase() !== latest.sha256.toLowerCase()) {
+    if (sha256.toLowerCase() !== latest.sha256.toLowerCase()) {
       return {
         ok: false,
-        error: `Update checksum mismatch (got ${sha256.slice(0, 12)}…)`,
+        error: `[VOA compliance] Update checksum mismatch (got ${sha256.slice(0, 12)}…)`,
       };
     }
     if (size < 500_000) {
@@ -2424,9 +3109,9 @@ const SUPPORT_LOG_DISCLAIMER = `SUPPORT LOG UPLOAD — PLEASE READ
 By uploading, you choose to send diagnostic information to Visions of Aetherius staff so they can help fix crashes, multiplayer, or launcher issues.
 
 What may be included (after automatic redaction):
-• Skyrim Platform / SKSE log tails
-• Launcher play log (paths partially redacted)
-• SkyrimPlatform.ini (non-secret settings)
+• Skyrim Platform / SKSE log tails from known My Games / SKSE folders
+• Launcher play log and related files under the VOA launcher data folder
+• Config and listings from VOA game folder(s) and base Skyrim (ini, plugin sizes)
 • Client/plugin file sizes and versions we already manage
 
 We try to remove Windows usernames, full home paths, tokens, and secrets before upload. Redaction is best-effort — do not paste passwords or personal secrets into the “reason” field.
@@ -2455,65 +3140,229 @@ function redactSupportLogText(input: string): string {
   return s;
 }
 
+/**
+ * Support-log roots: known VOA / SkyMP / SKSE locations only (no drive walk).
+ * Read-only; redacted later. Opt-in upload only.
+ */
+function collectSupportCandidateGameRoots(store: Store): string[] {
+  const out: string[] = [];
+  const add = (p: string | null | undefined) => {
+    if (!p) return;
+    try {
+      const r = path.resolve(p);
+      if (!fs.existsSync(r)) return;
+      if (!out.some((x) => x.toLowerCase() === r.toLowerCase())) out.push(r);
+    } catch {
+      /* ignore */
+    }
+  };
+  add(store.voaInstancePath);
+  add(store.skyrimPath);
+  // Launcher default instance under userData
+  add(path.join(app.getPath("userData"), "Game", "Skyrim Special Edition - VOA"));
+  // Common Steam sibling VOA folders (no full-disk scan)
+  const steamCommon = [
+    "C:\\Program Files (x86)\\Steam\\steamapps\\common",
+    "C:\\Program Files\\Steam\\steamapps\\common",
+    process.env.STEAM_LIBRARY &&
+      path.join(process.env.STEAM_LIBRARY, "steamapps", "common"),
+  ].filter(Boolean) as string[];
+  if (store.skyrimPath) {
+    try {
+      steamCommon.push(path.dirname(path.resolve(store.skyrimPath)));
+    } catch {
+      /* ignore */
+    }
+  }
+  for (const common of steamCommon) {
+    add(path.join(common, "Skyrim Special Edition"));
+    add(path.join(common, "Skyrim Special Edition - Visions of Aetherius"));
+    add(path.join(common, "Skyrim Special Edition - VOA"));
+  }
+  return out;
+}
+
+/** My Games / SKSE log directories where Skyrim Platform writes logs. */
+function collectSupportSkseLogDirs(): string[] {
+  const out: string[] = [];
+  const add = (p: string | null | undefined) => {
+    if (!p) return;
+    try {
+      const r = path.resolve(p);
+      if (!out.some((x) => x.toLowerCase() === r.toLowerCase())) out.push(r);
+    } catch {
+      /* ignore */
+    }
+  };
+  const myGames = (docs: string) =>
+    path.join(docs, "My Games", "Skyrim Special Edition", "SKSE");
+
+  // System Documents (may be redirected; still where SP often writes)
+  try {
+    add(myGames(app.getPath("documents")));
+  } catch {
+    /* ignore */
+  }
+  if (process.env.USERPROFILE) {
+    add(myGames(path.join(process.env.USERPROFILE, "Documents")));
+    // Common school/work OneDrive Documents layout (read-only for support)
+    try {
+      const home = process.env.USERPROFILE;
+      const od = path.join(home, "OneDrive");
+      if (fs.existsSync(od)) {
+        add(myGames(path.join(od, "Documents")));
+        // "OneDrive - OrgName/Documents"
+        try {
+          for (const ent of fs.readdirSync(od, { withFileTypes: true })) {
+            if (!ent.isDirectory()) continue;
+            if (!/^onedrive/i.test(ent.name) && !ent.name.includes(" - ")) {
+              // still check Documents under any OneDrive-* folder
+            }
+            add(myGames(path.join(od, ent.name, "Documents")));
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+  for (const key of ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]) {
+    const od = process.env[key];
+    if (od) add(myGames(path.join(od, "Documents")));
+  }
+  // Local fallbacks used by VOA when Documents is cloud-backed
+  for (const d of getLocalSkyrimMyGamesDirs()) {
+    add(path.join(d, "SKSE"));
+  }
+  add(path.join(app.getPath("userData"), "My Games", "Skyrim Special Edition", "SKSE"));
+  if (process.env.LOCALAPPDATA) {
+    add(
+      path.join(
+        process.env.LOCALAPPDATA,
+        "VOA",
+        "My Games",
+        "Skyrim Special Edition",
+        "SKSE"
+      )
+    );
+  }
+  return out;
+}
+
 function collectSupportLogBundle(): { text: string; files: string[] } {
   const parts: string[] = [];
   const files: string[] = [];
+  const seenPaths = new Set<string>();
   const maxPerFile = 180_000;
   const pushFile = (label: string, p: string) => {
     try {
       if (!p || !fs.existsSync(p)) return;
-      const st = fs.statSync(p);
+      const resolved = path.resolve(p);
+      const key = resolved.toLowerCase();
+      if (seenPaths.has(key)) return;
+      const st = fs.statSync(resolved);
       if (!st.isFile() || st.size <= 0) return;
-      let raw = fs.readFileSync(p, "utf8");
+      // Skip huge binaries (dmp/pak) — logs only
+      if (st.size > 8_000_000 && !/\.log$/i.test(resolved)) return;
+      seenPaths.add(key);
+      let raw = fs.readFileSync(resolved, "utf8");
       if (raw.length > maxPerFile) raw = raw.slice(raw.length - maxPerFile);
-      parts.push(`\n\n======== ${label} (${p}) size=${st.size} ========\n`);
+      parts.push(
+        `\n\n======== ${label} (${resolved}) size=${st.size} ========\n`
+      );
       parts.push(raw);
       files.push(label);
     } catch {
-      /* ignore missing */
+      /* ignore missing / unreadable */
     }
   };
 
-  const docsSkse = path.join(
-    app.getPath("documents"),
-    "My Games",
-    "Skyrim Special Edition",
-    "SKSE"
-  );
-  pushFile("skyrim-platform.log", path.join(docsSkse, "skyrim-platform.log"));
-  pushFile("skse64.log", path.join(docsSkse, "skse64.log"));
-  // Newest skse crash/load logs
-  try {
-    if (fs.existsSync(docsSkse)) {
+  const pushRecentLogsInDir = (
+    dir: string,
+    labelPrefix: string,
+    maxFiles = 8
+  ) => {
+    try {
+      if (!dir || !fs.existsSync(dir)) return;
       const logs = fs
-        .readdirSync(docsSkse)
+        .readdirSync(dir)
         .filter((n) => /\.log$/i.test(n))
-        .map((n) => ({ n, t: fs.statSync(path.join(docsSkse, n)).mtimeMs }))
-        .sort((a, b) => b.t - a.t)
-        .slice(0, 6);
-      for (const L of logs) {
-        if (L.n === "skyrim-platform.log" || L.n === "skse64.log") continue;
-        pushFile(L.n, path.join(docsSkse, L.n));
+        .map((n) => {
+          try {
+            return {
+              n,
+              t: fs.statSync(path.join(dir, n)).mtimeMs,
+            };
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean) as { n: string; t: number }[];
+      logs.sort((a, b) => b.t - a.t);
+      for (const L of logs.slice(0, maxFiles)) {
+        pushFile(`${labelPrefix}/${L.n}`, path.join(dir, L.n));
       }
+    } catch {
+      /* ignore */
     }
-  } catch {
-    /* ignore */
+  };
+
+  // --- SKSE / Skyrim Platform logs (all known My Games SKSE dirs) ---
+  const skseDirs = collectSupportSkseLogDirs();
+  parts.push(
+    `\n\n======== SKSE log dirs scanned (${skseDirs.length}) ========\n` +
+      skseDirs.map((d) => (fs.existsSync(d) ? `OK ${d}` : `miss ${d}`)).join("\n") +
+      "\n"
+  );
+  for (const docsSkse of skseDirs) {
+    pushFile("skyrim-platform.log", path.join(docsSkse, "skyrim-platform.log"));
+    pushFile("skse64.log", path.join(docsSkse, "skse64.log"));
+    pushFile("skse64_loader.log", path.join(docsSkse, "skse64_loader.log"));
+    pushRecentLogsInDir(docsSkse, "SKSE", 8);
   }
 
-  pushFile(
-    "voa-play.log",
-    path.join(app.getPath("userData"), "voa-play.log")
-  );
+  // --- Launcher logs ---
+  const ud = app.getPath("userData");
+  pushFile("voa-play.log", path.join(ud, "voa-play.log"));
+  pushRecentLogsInDir(ud, "launcher-userData", 6);
+  // electron / crashpad style logs if present (names only, small)
+  for (const name of [
+    "main.log",
+    "renderer.log",
+    "crash.log",
+    "voa-mod-installs.json",
+  ]) {
+    pushFile(name, path.join(ud, name));
+  }
 
+  // --- VOA game folders / Steam Skyrim roots ---
   const store = readStore();
-  const roots = [store.voaInstancePath, store.skyrimPath].filter(
-    Boolean
-  ) as string[];
+  const roots = collectSupportCandidateGameRoots(store);
+  parts.push(
+    `\n\n======== Game roots scanned (${roots.length}) ========\n` +
+      roots.join("\n") +
+      "\n"
+  );
   for (const root of roots) {
+    const short = path.basename(root);
     pushFile(
-      "SkyrimPlatform.ini",
+      `${short}/SkyrimPlatform.ini`,
       path.join(root, "Data", "SKSE", "Plugins", "SkyrimPlatform.ini")
     );
+    pushFile(
+      `${short}/skse64_loader.log`,
+      path.join(root, "skse64_loader.log")
+    );
+    pushFile(`${short}/skse64.log`, path.join(root, "skse64.log"));
+    pushFile(
+      `${short}/.voa-instance.json`,
+      path.join(root, ".voa-instance.json")
+    );
+    // Logs next to game exe (rare)
+    pushRecentLogsInDir(root, short, 4);
+    pushRecentLogsInDir(path.join(root, "Data", "SKSE"), `${short}/Data/SKSE`, 6);
     try {
       const plugins = path.join(root, "Data", "Platform", "Plugins");
       if (fs.existsSync(plugins)) {
@@ -2532,6 +3381,11 @@ function collectSupportLogBundle(): { text: string; files: string[] } {
           `\n\n======== Platform/Plugins listing (${root}) ========\n${list}\n`
         );
         files.push("Platform/Plugins listing");
+        // settings file is small and useful
+        pushFile(
+          `${short}/skymp5-client-settings.txt`,
+          path.join(plugins, "skymp5-client-settings.txt")
+        );
       }
     } catch {
       /* ignore */
@@ -2549,6 +3403,32 @@ function collectSupportLogBundle(): { text: string; files: string[] } {
         parts.push(
           `\n\n======== skymp5-client.js meta ========\npath=${client}\nsize=${st.size}\nmtime=${st.mtime.toISOString()}\n`
         );
+        files.push("skymp5-client.js meta");
+      }
+    } catch {
+      /* ignore */
+    }
+    // SKSE Plugins dir listing (dll sizes — diagnose SP stack without dumping binaries)
+    try {
+      const sksePlug = path.join(root, "Data", "SKSE", "Plugins");
+      if (fs.existsSync(sksePlug)) {
+        const list = fs
+          .readdirSync(sksePlug)
+          .filter((n) => !n.startsWith("_"))
+          .map((n) => {
+            try {
+              const st = fs.statSync(path.join(sksePlug, n));
+              if (!st.isFile()) return `${n}/`;
+              return `${n}\t${st.size}`;
+            } catch {
+              return n;
+            }
+          })
+          .join("\n");
+        parts.push(
+          `\n\n======== Data/SKSE/Plugins listing (${root}) ========\n${list}\n`
+        );
+        files.push("SKSE/Plugins listing");
       }
     } catch {
       /* ignore */
@@ -2556,7 +3436,7 @@ function collectSupportLogBundle(): { text: string; files: string[] } {
   }
 
   parts.unshift(
-    `VOA support log bundle\ncollectedAt=${new Date().toISOString()}\nlauncher=${app.getVersion()}\napi=${API_BASE}\nplatform=${process.platform}\narch=${process.arch}\n`
+    `VOA support log bundle\ncollectedAt=${new Date().toISOString()}\nlauncher=${app.getVersion()}\napi=${API_BASE}\nplatform=${process.platform}\narch=${process.arch}\nfilesIncluded=${files.length}\n`
   );
 
   let text = redactSupportLogText(parts.join(""));
@@ -2876,26 +3756,245 @@ ipcMain.handle("voa:openDiscordLogin", async () => {
 
 ipcMain.handle("voa:pickSkyrimPath", async () => {
   const res = await dialog.showOpenDialog({
-    title: "Select your Skyrim Special Edition folder",
+    title: "Select your Skyrim Special Edition folder (local disk only — not OneDrive)",
     properties: ["openDirectory"],
   });
   if (res.canceled || !res.filePaths[0]) return null;
   const dir = res.filePaths[0];
+  const od = rejectOneDrivePath(dir, "Skyrim folder");
+  if (od) return { error: od };
   if (!fs.existsSync(path.join(dir, "SkyrimSE.exe")) && !fs.existsSync(path.join(dir, "skse64_loader.exe"))) {
     return { error: "Folder does not look like Skyrim SE" };
+  }
+  let instancePath = defaultInstancePath(dir, app.getPath("userData"));
+  if (isOneDrivePath(instancePath) || pathLooksLikeProgramFiles(instancePath)) {
+    instancePath = path.join(
+      app.getPath("userData"),
+      "Game",
+      "Skyrim Special Edition - VOA"
+    );
   }
   // Source only — instance path is derived next Play (or Rebuild)
   writeStore({
     skyrimPath: dir,
-    voaInstancePath: defaultInstancePath(dir, app.getPath("userData")),
+    voaInstancePath: instancePath,
   });
   return { path: dir };
 });
 
 ipcMain.handle("voa:setSkyrimPath", (_e, p: string) => {
+  const od = rejectOneDrivePath(p, "Skyrim folder");
+  if (od) return { ok: false, error: od };
   writeStore({ skyrimPath: p });
   return true;
 });
+
+/**
+ * Download + extract a local VOA CDN mod package into skyrim root.
+ * Used by Play auto-install (does not require Nexus).
+ */
+async function installLocalModPackage(
+  packageId: string,
+  skyrim: string
+): Promise<{ ok: boolean; error?: string }> {
+  const tmpRoot = path.join(app.getPath("temp"), "voa-mods-auto", packageId);
+  const zipPath = path.join(tmpRoot, "package.zip");
+  const extractDir = path.join(tmpRoot, "extract");
+  try {
+    if (!(await ensureApiRunning())) {
+      return { ok: false, error: `Cannot reach API at ${API_BASE}` };
+    }
+    const catRes = await apiRequest<{ packages: CatalogPackage[] }>("GET", "/v1/mods");
+    if (!catRes.ok) return { ok: false, error: catRes.raw || "mod catalog failed" };
+    const pkg = (catRes.data?.packages || []).find((p) => p.id === packageId);
+    if (!pkg) return { ok: false, error: `package ${packageId} not in catalog` };
+    if (pkg.source === "nexus" || !pkg.downloadUrl) {
+      return { ok: false, error: `${packageId} is not a local CDN package` };
+    }
+    if (pkg.available === false) {
+      return { ok: false, error: `${packageId} archive not available on server` };
+    }
+
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    fs.mkdirSync(tmpRoot, { recursive: true });
+    playLog(`auto-mod download ${packageId} ${pkg.downloadUrl}`);
+    const dl = await downloadFile(pkg.downloadUrl, zipPath, packageId, pkg.size);
+    if (pkg.sha256 && dl.sha256.toLowerCase() !== pkg.sha256.toLowerCase()) {
+      return {
+        ok: false,
+        error: `checksum mismatch for ${packageId}`,
+      };
+    }
+    fs.mkdirSync(extractDir, { recursive: true });
+    await extractZip(zipPath, extractDir);
+
+    // Copy all files under extract into skyrim (preserve structure)
+    const walk = (dir: string, base: string): string[] => {
+      const out: string[] = [];
+      for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+        const abs = path.join(dir, ent.name);
+        if (ent.isDirectory()) out.push(...walk(abs, base));
+        else out.push(path.relative(base, abs));
+      }
+      return out;
+    };
+    const files = walk(extractDir, extractDir);
+    const installedRels: string[] = [];
+    for (const rel of files) {
+      const from = path.join(extractDir, rel);
+      // Normalize zip paths that used backslashes
+      const relNorm = rel.replace(/\\/g, "/");
+      const to = path.join(skyrim, ...relNorm.split("/"));
+      try {
+        copyBreakHardlink(from, to);
+      } catch {
+        // Fallback plain copy
+        fs.mkdirSync(path.dirname(to), { recursive: true });
+        try {
+          fs.unlinkSync(to);
+        } catch {
+          /* ignore */
+        }
+        fs.copyFileSync(from, to);
+      }
+      installedRels.push(relNorm);
+    }
+    const installs = readInstalls();
+    installs.packages[packageId] = {
+      id: packageId,
+      name: pkg.name || packageId,
+      version: pkg.version || "0",
+      installedAt: new Date().toISOString(),
+      files: installedRels,
+      size: dl.size,
+      sha256: dl.sha256,
+    } as InstalledModRecord;
+    writeInstalls(installs);
+    playLog(`auto-mod installed ${packageId} files=${installedRels.length}`);
+    return { ok: true };
+  } catch (e: any) {
+    playLog(`auto-mod fail ${packageId}: ${e?.message || e}`);
+    return { ok: false, error: e?.message || String(e) };
+  } finally {
+    try {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Ensure SKSE + Address Library + VOA MP core exist before launch.
+ * Auto-installs missing LOCAL packages so friends don't need manual Mods tab.
+ */
+async function ensureRequiredLocalRuntime(
+  skyrim: string
+): Promise<{ ok: boolean; error?: string; installed: string[] }> {
+  const installed: string[] = [];
+  // Friends often have wrong AE build — SP console never appears (REL crash).
+  const exeVer = getSkyrimExeVersion(skyrim);
+  if (exeVer) {
+    playLog(`SkyrimSE.exe FileVersion=${exeVer}`);
+    if (!exeVer.startsWith("1.6.1170")) {
+      return {
+        ok: false,
+        error:
+          `Skyrim SE version is ${exeVer}, but VOA multiplayer requires Anniversary Edition 1.6.1170. ` +
+          "Update Skyrim SE via Steam (no downgrade/beta), then Rebuild VOA folder in Settings and Play.",
+        installed,
+      };
+    }
+  } else {
+    playLog("SkyrimSE.exe version could not be read (continuing)");
+  }
+  // Loader alone is not enough — lean VOA clone skips Data/Scripts, so Actor.pex etc.
+  // go missing while skse64_loader.exe remains. SP then logs "Missing files: Actor.pex…".
+  const needSkse =
+    !fs.existsSync(path.join(skyrim, "skse64_loader.exe")) ||
+    !hasSksePapyrusScripts(skyrim);
+  // Missing files OR mixed pack sizes (SP dll + Impl from different builds) → REL crash
+  const needSp = needsVoaMpCoreReinstall(skyrim);
+  const needAl = !fs.existsSync(
+    path.join(skyrim, "Data", "SKSE", "Plugins", "versionlib-1-6-1170-0.bin")
+  );
+  if (needSp) {
+    playLog("voa-mp-core reinstall required (missing or mismatched SP stack)");
+  }
+  if (needSkse && fs.existsSync(path.join(skyrim, "skse64_loader.exe"))) {
+    playLog("SKSE scripts missing (Actor.pex/etc) — reinstalling skse-ae package");
+  }
+
+  if (needSkse) {
+    const r = await installLocalModPackage("skse-ae-2.2.6", skyrim);
+    if (!r.ok) {
+      return {
+        ok: false,
+        error: r.error || "Failed to auto-install SKSE",
+        installed,
+      };
+    }
+    installed.push("skse-ae-2.2.6");
+    if (!hasSksePapyrusScripts(skyrim)) {
+      return {
+        ok: false,
+        error:
+          "SKSE Papyrus scripts still missing after install (Data/Scripts/Actor.pex). " +
+          "Install SKSE64 AE 2.2.6 from the Mods tab, then Play again.",
+        installed,
+      };
+    }
+  }
+  if (needSp) {
+    // Hardlinks / partial installs leave mixed SP builds → REL crash, no console.
+    wipeVoaMpCoreFiles(skyrim);
+    const r = await installLocalModPackage("voa-mp-core", skyrim);
+    if (!r.ok) {
+      return {
+        ok: false,
+        error:
+          (r.error || "Failed to auto-install VOA Multiplayer Core (Skyrim Platform)") +
+          " If your game folder is under Program Files, run the launcher as Administrator once, then Play.",
+        installed,
+      };
+    }
+    installed.push("voa-mp-core");
+    if (!isPreferredSpStack(skyrim) || !hasCompleteRuntimeDeps(skyrim)) {
+      const p = spStackPaths(skyrim);
+      playLog(
+        `voa-mp-core still bad after install sp=${fileSizeOr0(p.spDll)} mp=${fileSizeOr0(p.mpDll)} impl=${fileSizeOr0(p.impl)} rd=${hasCompleteRuntimeDeps(skyrim)}`
+      );
+      return {
+        ok: false,
+        error:
+          "Skyrim Platform install incomplete (mixed or locked files). In Settings → Rebuild VOA game folder, " +
+          "then Play again. Or run launcher as Admin if the folder is under Program Files. " +
+          `Need Impl size ${VOA_SP_STACK.skyrimPlatformImpl}, got ${fileSizeOr0(p.impl)}.`,
+        installed,
+      };
+    }
+    playLog("voa-mp-core stack OK after wipe+reinstall");
+  }
+  if (needAl) {
+    // Prefer local VOA address-library package (no Nexus login)
+    let r = await installLocalModPackage("voa-address-library", skyrim);
+    if (!r.ok) {
+      // Fallback catalog id if server not redeployed yet
+      r = await installLocalModPackage("address-library-ae", skyrim);
+    }
+    if (!r.ok) {
+      return {
+        ok: false,
+        error:
+          r.error ||
+          "Failed to auto-install Address Library. Install it from Mods (VOA Address Library).",
+        installed,
+      };
+    }
+    installed.push("voa-address-library");
+  }
+  return { ok: true, installed };
+}
 
 ipcMain.handle("voa:play", async (_e, opts?: { characterSlot?: number }) => {
   try {
@@ -3092,11 +4191,49 @@ ipcMain.handle("voa:play", async (_e, opts?: { characterSlot?: number }) => {
       /* ignore */
     }
 
+    // Auto-install required LOCAL runtime packages if missing (friends often skip Mods tab).
+    // SKSE + VOA MP core + Address Library bin — all hosted on VOA CDN (no Nexus login).
+    const autoNotes: string[] = [];
+    try {
+      const autoRes = await ensureRequiredLocalRuntime(skyrim);
+      if (autoRes.installed.length) {
+        autoNotes.push(...autoRes.installed);
+        playLog(`auto-installed: ${autoRes.installed.join(", ")}`);
+      }
+      if (!autoRes.ok) {
+        return {
+          ok: false,
+          error:
+            autoRes.error ||
+            "Could not auto-install multiplayer runtime. Open Mods → Install All Required, then Play.",
+        };
+      }
+      // voa-mp-core zip may reintroduce fmt/spdlog into SKSE Plugins — strip again
+      if (autoRes.installed.length) {
+        const lean = ensureLeanSpStack(skyrim);
+        if (lean.length) playLog(`post-auto lean: ${lean.join(", ")}`);
+      }
+    } catch (eAuto: any) {
+      playLog(`auto-install err: ${eAuto?.message || eAuto}`);
+    }
+
+    if (pathLooksLikeProgramFiles(skyrim)) {
+      playLog(`WARN play path still under Program Files: ${skyrim}`);
+      return {
+        ok: false,
+        error:
+          "VOA game folder is under Program Files, which blocks multiplayer (UAC). " +
+          "In Settings → Rebuild VOA game folder (or clear the VOA path). " +
+          "The new folder will be under your user AppData (writable). Then Play again. " +
+          `Current: ${skyrim}`,
+      };
+    }
+
     const loader = path.join(skyrim, "skse64_loader.exe");
     if (!fs.existsSync(loader)) {
       return {
         ok: false,
-        error: `skse64_loader.exe not found in ${skyrim}. Install SKSE64 AE 2.2.6 from the Mods tab.`,
+        error: `skse64_loader.exe not found in ${skyrim}. Install SKSE64 AE 2.2.6 from the Mods tab (or use Play again to auto-install).`,
       };
     }
 
@@ -3115,14 +4252,14 @@ ipcMain.handle("voa:play", async (_e, opts?: { characterSlot?: number }) => {
       return {
         ok: false,
         error:
-          "Skyrim Platform is not installed correctly (missing SkyrimPlatform.dll / SkyrimPlatformImpl.dll). Install SP 2.9 for AE 1.6.1170, then Play again.",
+          "Skyrim Platform is not installed correctly (missing SkyrimPlatform.dll / SkyrimPlatformImpl.dll). Open Mods → install VOA Multiplayer Core, then Play again.",
       };
     }
     if (!fs.existsSync(mpDll)) {
       return {
         ok: false,
         error:
-          "MpClientPlugin.dll is missing under Data\\SKSE\\Plugins. Install the VOA multiplayer core / Skyrim Platform package.",
+          "MpClientPlugin.dll is missing under Data\\SKSE\\Plugins. Open Mods → install VOA Multiplayer Core.",
       };
     }
 
@@ -3139,7 +4276,7 @@ ipcMain.handle("voa:play", async (_e, opts?: { characterSlot?: number }) => {
       return {
         ok: false,
         error:
-          "Address Library for SKSE is missing versionlib-1-6-1170-0.bin (required for game 1.6.1170). Install Address Library All in One from the Mods tab / Nexus, then Play again.",
+          "Address Library is missing versionlib-1-6-1170-0.bin. Open Mods → install Address Library (AE 1.6.1170), then Play again.",
       };
     }
 
@@ -3467,19 +4604,20 @@ async function extractZip(zipPath: string, destDir: string): Promise<void> {
       windowsHide: true,
       timeout: 120_000,
     });
-    return;
   } catch {
     // Fallback: PowerShell Expand-Archive
+    await execFileAsync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-Command",
+        `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`,
+      ],
+      { windowsHide: true, timeout: 120_000 }
+    );
   }
-  await execFileAsync(
-    "powershell.exe",
-    [
-      "-NoProfile",
-      "-Command",
-      `Expand-Archive -LiteralPath '${zipPath.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`,
-    ],
-    { windowsHide: true, timeout: 120_000 }
-  );
+  // Nexus §6 — validate every path after extract (zip-slip), before any install copy
+  validateExtractedTree(destDir, destDir);
 }
 
 function listFilesRecursive(dir: string, base = dir): string[] {
@@ -3632,7 +4770,11 @@ ipcMain.handle(
       let sha256 = "";
 
       if (isNexus) {
-        // User OAuth session — Free/Premium from their Nexus browser login.
+        // =====================================================================
+        // NEXUS COMPLIANCE §1–§2 (letter of the law):
+        // ONLY user-initiated OAuth Bearer token → download_link → direct CDN.
+        // NO server personal apikey. NO VOA proxy of Nexus file bytes.
+        // =====================================================================
         if (!nexusGame || !nexusModId || !nexusFileId) {
           throw new Error("Catalog is missing Nexus file ids for this package");
         }
@@ -3644,8 +4786,8 @@ ipcMain.handle(
           total: pkg.size || 0,
           percent: 0,
           message: store.nexusUser?.isPremium
-            ? "Requesting Nexus Premium download link…"
-            : "Requesting Nexus download link (Free account)…",
+            ? "Requesting Nexus Premium download link (user OAuth)…"
+            : "Requesting Nexus download link (user OAuth / Free)…",
         });
 
         const accessToken = await getValidNexusAccessToken();
@@ -3655,6 +4797,11 @@ ipcMain.handle(
           nexusModId,
           nexusFileId
         );
+        if (!String(cdnUri).startsWith("https://")) {
+          throw new Error(
+            "[VOA compliance] Nexus CDN URI must be HTTPS (direct download only)"
+          );
+        }
 
         emitModProgress({
           packageId,
@@ -3760,7 +4907,8 @@ ipcMain.handle(
         message: "Installing files…",
       });
 
-      const staged = listFilesRecursive(extractDir);
+      // Nexus §6 — reject zip-slip / absolute paths before any install
+      const staged = validateExtractedTree(extractDir, extractDir);
       const installedFiles: string[] = [];
 
       for (const rel of staged) {
@@ -3775,7 +4923,8 @@ ipcMain.handle(
         } else if (isNexus) {
           destRel = remapNexusInstallRel(rel, remapSkse);
         }
-        // Normalize to forward-slash storage, Windows path ops use path.join
+        // Final destination must remain under skyrim root
+        destRel = assertSafeArchiveRelPath(destRel, skyrim);
         const destAbs = path.join(skyrim, destRel);
         const srcAbs = path.join(extractDir, rel);
         copyFileEnsuringDir(srcAbs, destAbs);
@@ -3986,6 +5135,259 @@ ipcMain.handle("voa:verifyMods", async () => {
   }
 });
 
+/**
+ * Deep check of the VOA playable folder (SKSE + Address Library + SP stack + CEF + client).
+ * Read-only — does not reinstall or rebuild. Safe for players to run anytime.
+ */
+ipcMain.handle("voa:verifyGameFolder", async () => {
+  type Check = {
+    id: string;
+    label: string;
+    ok: boolean;
+    detail: string;
+    severity: "error" | "warn" | "ok";
+  };
+  try {
+    const playRoot = resolvePlayableSkyrim();
+    if (!playRoot.ok || !playRoot.path) {
+      return {
+        ok: false,
+        error: playRoot.error || "VOA game folder not ready. Set base Skyrim path in Settings.",
+      };
+    }
+    const skyrim = playRoot.path;
+    const checks: Check[] = [];
+    const add = (
+      id: string,
+      label: string,
+      ok: boolean,
+      detail: string,
+      severity: "error" | "warn" | "ok" = ok ? "ok" : "error"
+    ) => {
+      checks.push({ id, label, ok, detail, severity: ok ? "ok" : severity });
+    };
+
+    const exists = (rel: string) => {
+      try {
+        return fs.existsSync(path.join(skyrim, rel));
+      } catch {
+        return false;
+      }
+    };
+    const sizeOf = (rel: string) => fileSizeOr0(path.join(skyrim, rel));
+
+    add(
+      "path",
+      "VOA game folder",
+      true,
+      skyrim,
+      "ok"
+    );
+    if (pathLooksLikeProgramFiles(skyrim)) {
+      add(
+        "program-files",
+        "Folder location",
+        false,
+        "Under Program Files — multiplayer often fails (UAC). Use Settings → Rebuild only if staff ask; the new launcher moves VOA under AppData automatically.",
+        "error"
+      );
+    } else if (isOneDrivePath(skyrim)) {
+      add(
+        "onedrive",
+        "Folder location",
+        false,
+        "Path is on OneDrive — not allowed for VOA.",
+        "error"
+      );
+    } else {
+      add("location", "Folder location", true, "Writable local path (not Program Files / OneDrive)");
+    }
+
+    add(
+      "skyrimse",
+      "SkyrimSE.exe",
+      exists("SkyrimSE.exe"),
+      exists("SkyrimSE.exe")
+        ? `present${(() => {
+            const v = getSkyrimExeVersion(skyrim);
+            return v ? ` (FileVersion ${v})` : "";
+          })()}`
+        : "missing — set the real Steam Skyrim SE folder in Settings"
+    );
+    const exeVer = getSkyrimExeVersion(skyrim);
+    if (exeVer && !exeVer.startsWith("1.6.1170")) {
+      add(
+        "exe-version",
+        "Skyrim version",
+        false,
+        `${exeVer} — VOA needs AE 1.6.1170`,
+        "error"
+      );
+    } else if (exeVer) {
+      add("exe-version", "Skyrim version", true, exeVer);
+    }
+
+    add(
+      "skse-loader",
+      "skse64_loader.exe",
+      exists("skse64_loader.exe"),
+      exists("skse64_loader.exe")
+        ? `present (${sizeOf("skse64_loader.exe")} bytes)`
+        : "missing — Play auto-installs SKSE, or use Mods → SKSE64 AE 2.2.6"
+    );
+    add(
+      "skse-dll",
+      "skse64_1_6_1170.dll",
+      exists("skse64_1_6_1170.dll"),
+      exists("skse64_1_6_1170.dll")
+        ? `present (${sizeOf("skse64_1_6_1170.dll")} bytes)`
+        : "missing — reinstall SKSE package"
+    );
+
+    const alPath = path.join("Data", "SKSE", "Plugins", "versionlib-1-6-1170-0.bin");
+    add(
+      "address-library",
+      "Address Library (1.6.1170)",
+      exists(alPath),
+      exists(alPath)
+        ? `versionlib-1-6-1170-0.bin (${sizeOf(alPath)} bytes)`
+        : "missing — Play auto-installs VOA Address Library"
+    );
+
+    const p = spStackPaths(skyrim);
+    const spSz = fileSizeOr0(p.spDll);
+    const mpSz = fileSizeOr0(p.mpDll);
+    const implSz = fileSizeOr0(p.impl);
+    const preferred = isPreferredSpStack(skyrim);
+    const matched = isMatchedSpStack(skyrim);
+    if (preferred) {
+      add(
+        "sp-stack",
+        "Skyrim Platform stack",
+        true,
+        `preferred A matched (sp=${spSz} mp=${mpSz} impl=${implSz})`
+      );
+    } else if (matched) {
+      add(
+        "sp-stack",
+        "Skyrim Platform stack",
+        false,
+        `legacy B sizes (sp=${spSz} mp=${mpSz} impl=${implSz}) — Play will upgrade to preferred stack; or install VOA Multiplayer Core from Mods`,
+        "warn"
+      );
+    } else {
+      add(
+        "sp-stack",
+        "Skyrim Platform stack",
+        false,
+        `missing or mismatched (sp=${spSz} mp=${mpSz} impl=${implSz}; want ${VOA_SP_STACK.skyrimPlatformDll}/${VOA_SP_STACK.mpClientDll}/${VOA_SP_STACK.skyrimPlatformImpl})`,
+        "error"
+      );
+    }
+
+    const rdOk = hasCompleteRuntimeDeps(skyrim);
+    add(
+      "runtime-deps",
+      "RuntimeDependencies + CEF",
+      rdOk,
+      rdOk
+        ? "Impl, libcef, ChakraCore, fmt, spdlog, resources.pak present"
+        : "incomplete CEF/Impl pack — install VOA Multiplayer Core (Play auto-installs)"
+    );
+
+    // Official Plugins: no fmt/spdlog as SKSE plugins
+    const plugFmt = exists(path.join("Data", "SKSE", "Plugins", "fmt.dll"));
+    const plugSpd = exists(path.join("Data", "SKSE", "Plugins", "spdlog.dll"));
+    if (plugFmt || plugSpd) {
+      add(
+        "plugins-layout",
+        "SKSE Plugins layout",
+        false,
+        "fmt.dll/spdlog.dll should not live under Data/SKSE/Plugins (Play lean-strip removes them)",
+        "warn"
+      );
+    } else {
+      add(
+        "plugins-layout",
+        "SKSE Plugins layout",
+        true,
+        "only SP + MpClient + Address Library expected"
+      );
+    }
+
+    const clientPath = path.join("Data", "Platform", "Plugins", "skymp5-client.js");
+    const clientSz = sizeOf(clientPath);
+    add(
+      "client",
+      "skymp5-client.js",
+      clientSz > 10_000,
+      clientSz > 10_000
+        ? `present (${clientSz} bytes)`
+        : "missing or too small — Play downloads the live client"
+    );
+
+    const spIni = path.join("Data", "SKSE", "Plugins", "SkyrimPlatform.ini");
+    let iniOk = false;
+    let iniDetail = "missing — Play writes Cmd=true";
+    if (exists(spIni)) {
+      try {
+        const txt = fs.readFileSync(path.join(skyrim, spIni), "utf8");
+        const cmdOn = /Cmd\s*=\s*true/i.test(txt);
+        iniOk = cmdOn;
+        iniDetail = cmdOn
+          ? "Cmd = true (console enabled)"
+          : "Cmd is not true — Play rewrites this; if console still missing, contact staff";
+      } catch {
+        iniDetail = "unreadable";
+      }
+    }
+    add("sp-ini", "SkyrimPlatform.ini", iniOk, iniDetail, iniOk ? "ok" : "warn");
+
+    const scriptsOk = hasSksePapyrusScripts(skyrim);
+    add(
+      "skse-scripts",
+      "SKSE Papyrus scripts (Data/Scripts)",
+      scriptsOk,
+      scriptsOk
+        ? "Actor.pex / Form.pex / skse.pex present"
+        : "missing Actor.pex (and friends) — Play will reinstall SKSE scripts; causes SP “Missing files” exception"
+    );
+
+    const errors = checks.filter((c) => !c.ok && c.severity === "error");
+    const warns = checks.filter((c) => !c.ok && c.severity === "warn");
+    const allOk = errors.length === 0;
+    let message: string;
+    if (allOk && warns.length === 0) {
+      message =
+        "VOA game folder looks healthy. If multiplayer still fails, upload Support logs — do not Rebuild unless staff ask.";
+    } else if (allOk) {
+      message = `Folder OK with ${warns.length} warning(s). Prefer Play (auto-fix) over Rebuild unless staff instruct you.`;
+    } else {
+      message = `Found ${errors.length} problem(s)${warns.length ? ` and ${warns.length} warning(s)` : ""}. Press Play to auto-repair when possible. Only use Rebuild VOA game folder if staff tell you to.`;
+    }
+
+    playLog(
+      `verifyGameFolder path=${skyrim} ok=${allOk} errors=${errors.length} warns=${warns.length}`
+    );
+
+    return {
+      ok: true,
+      healthy: allOk,
+      playPath: skyrim,
+      sourcePath: playRoot.sourcePath || null,
+      usingInstance: Boolean(playRoot.usingInstance),
+      preferredStack: preferred,
+      matchedStack: matched,
+      checks,
+      errorCount: errors.length,
+      warnCount: warns.length,
+      message,
+    };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+});
+
 /** Remove every tracked VOA mod package from the playable game folder. */
 ipcMain.handle("voa:uninstallAllMods", async () => {
   try {
@@ -4125,10 +5527,13 @@ ipcMain.handle(
         message: "Installing files…",
       });
 
-      const staged = listFilesRecursive(extractDir);
+      const staged = validateExtractedTree(extractDir, extractDir);
       const installedFiles: string[] = [];
       for (const rel of staged) {
-        const destRel = remapNexusInstallRel(rel, remapSkse);
+        const destRel = assertSafeArchiveRelPath(
+          remapNexusInstallRel(rel, remapSkse),
+          skyrim
+        );
         const destAbs = path.join(skyrim, destRel);
         const srcAbs = path.join(extractDir, rel);
         copyFileEnsuringDir(srcAbs, destAbs);

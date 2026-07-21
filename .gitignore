@@ -27,3 +27,7 @@ public-release/*.zip
 GrokAPI.env
 tmp-*.png
 *.png.bak
+secrets/
+**/voa-update-signing*
+*.pem
+*.key
