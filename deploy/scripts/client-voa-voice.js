@@ -7,17 +7,19 @@
  * - Pushes local pos + nearby profile distances into CEF for spatial gain
  *
  * Mic/WebRTC live in CEF (in-process overlay), not a separate desktop app.
+ *
+ * Boot is deferred until skyrimPlatform is ready (once update) — bare IIFE at
+ * parse time often has no global yet and would silently no-op.
  */
 (function () {
-  var sp = null;
+  function startVoaVoice(sp) {
+  if (!sp) return;
   try {
-    // skyrimPlatform global in plugins
-    sp = skyrimPlatform;
-  } catch (e) {
+    if (sp.storage["voaVoiceReady"]) return;
+    sp.storage["voaVoiceReady"] = true;
+  } catch (eR) {
     return;
   }
-  if (!sp || sp.storage["voaVoiceReady"]) return;
-  sp.storage["voaVoiceReady"] = true;
 
   var MASTER = "http://127.0.0.1:3100";
   var SESSION = "";
@@ -496,5 +498,67 @@
     }
   });
 
-  log("plugin loaded");
+  log("plugin loaded v2 (deferred boot, cycle=B ptt=V)");
+  } // end startVoaVoice
+
+  function scheduleBoot() {
+    var sp = null;
+    try {
+      sp = skyrimPlatform;
+    } catch (e0) {
+      sp = null;
+    }
+    if (!sp) return false;
+    try {
+      sp.storage._voaSetupVoice = function () {
+        try {
+          startVoaVoice(skyrimPlatform);
+        } catch (eS) {
+          try {
+            skyrimPlatform.printConsole("[VOA voice] setup err " + eS);
+          } catch (e2) {}
+        }
+      };
+    } catch (e1) {}
+    try {
+      sp.once("update", function () {
+        try {
+          startVoaVoice(skyrimPlatform);
+        } catch (eU) {
+          try {
+            skyrimPlatform.printConsole("[VOA voice] boot err " + eU);
+          } catch (e3) {}
+        }
+      });
+      try {
+        sp.printConsole("[VOA voice] boot scheduled");
+      } catch (eL) {}
+      return true;
+    } catch (e2) {
+      try {
+        startVoaVoice(sp);
+        return true;
+      } catch (e3) {
+        return false;
+      }
+    }
+  }
+
+  if (!scheduleBoot()) {
+    // Retry a few frames via polling global if SP loads after this file
+    var tries = 0;
+    var iv = null;
+    try {
+      iv = setInterval(function () {
+        tries++;
+        if (scheduleBoot() || tries > 200) {
+          try {
+            clearInterval(iv);
+          } catch (eC) {}
+        }
+      }, 50);
+    } catch (eI) {
+      // Chakra/SP may lack setInterval — front/index once(update) path still works via _voaSetupVoice
+    }
+  }
 })();
