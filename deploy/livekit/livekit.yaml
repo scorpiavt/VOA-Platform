@@ -1,0 +1,22 @@
+# VOA LiveKit SFU — proximity voice media plane
+# Copy to VPS and set keys via env or replace keys: below.
+# Docs: docs/VOICE_CHAT.md
+
+port: 7880
+log_level: info
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  # Advertise public IP to clients (Hetzner / cloud)
+  use_external_ip: true
+
+# keys:
+#   APIKeyReplaceMe: APISecretReplaceMe_long_random
+
+# Prefer TURN when players are behind strict NAT (optional for LAN tests)
+# turn:
+#   enabled: true
+#   domain: voice.visionsofaetherius.com
+#   tls_port: 3478

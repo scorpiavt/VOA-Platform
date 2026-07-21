@@ -1,0 +1,21 @@
+# VOA proximity voice — LiveKit SFU
+# Usage (VPS):
+#   1. docker run --rm livekit/livekit-server generate-keys
+#   2. Put API key/secret into livekit.yaml under keys: and into VOA API .env
+#   3. docker compose -f deploy/livekit/docker-compose.yml up -d
+#
+# Firewall: TCP 7880 (signal), TCP 7881 (RTC TCP), UDP 50000-50100 (RTC)
+# Production: put Caddy/nginx TLS in front and set LIVEKIT_URL=wss://voice.yourdomain
+
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    network_mode: host
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    environment:
+      # Optional: inject keys without editing yaml
+      # LIVEKIT_KEYS: "APIxxx: secretxxx"
+      LIVEKIT_CONFIG: ""

@@ -81,6 +81,7 @@ GraphQL (metadata only): [graphql.nexusmods.com](https://graphql.nexusmods.com/#
 | Signed launcher updates (sha256 + Ed25519) | **Enforced** |
 | Archive path validation (zip-slip) | **Enforced** |
 | No default production secrets | **Enforced** |
+| Proximity voice (in-game CEF + LiveKit) | **Scaffolded** — see `docs/VOICE_CHAT.md` |
 
 ## VPS game server
 

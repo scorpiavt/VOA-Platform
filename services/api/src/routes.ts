@@ -72,6 +72,11 @@ import {
   SUPPORT_LOG_RETENTION_DAYS,
   toPublicSupportLog,
 } from "./supportLogs";
+import {
+  getVoicePublicConfig,
+  mintLiveKitAccessToken,
+  voiceEnabled,
+} from "./voice";
 
 async function requireUser(req: FastifyRequest): Promise<DbUser> {
   const header = req.headers.authorization;
@@ -116,6 +121,105 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   app.get("/health", async () => ({ ok: true }));
 
   app.get("/v1/status", async () => getServerStatus());
+
+  /**
+   * Proximity voice — public config (safe to call before login).
+   * In-game CEF + SP client use this to know if LiveKit is live.
+   */
+  app.get("/v1/voice/config", async () => getVoicePublicConfig());
+
+  /**
+   * Mint LiveKit access token for in-game proximity voice.
+   * Auth: game session (preferred from SP) OR launcher Bearer JWT.
+   */
+  app.post("/v1/voice/token", async (req, reply) => {
+    if (!voiceEnabled()) {
+      return reply.code(503).send({
+        error: "Proximity voice is not enabled on this server",
+        enabled: false,
+      });
+    }
+
+    const body = (req.body || {}) as {
+      session?: string;
+      characterSlot?: number;
+      displayName?: string;
+    };
+
+    let profileId = 0;
+    let userId = 0;
+    let characterSlot =
+      typeof body.characterSlot === "number" &&
+      body.characterSlot >= 0 &&
+      body.characterSlot <= 1
+        ? body.characterSlot
+        : 0;
+
+    const session = String(body.session || "").trim();
+    if (session) {
+      const row = getDb()
+        .prepare(
+          `SELECT user_id, profile_id FROM game_sessions
+           WHERE session_id = ? AND datetime(expires_at) > datetime('now')`
+        )
+        .get(session) as { user_id: number; profile_id: number } | undefined;
+      if (!row) {
+        return reply.code(401).send({ error: "Invalid or expired session" });
+      }
+      userId = row.user_id;
+      profileId = row.profile_id;
+    } else {
+      try {
+        const user = await requireUser(req);
+        userId = user.id;
+        profileId = user.profile_id;
+      } catch {
+        return reply
+          .code(401)
+          .send({ error: "session or Authorization Bearer required" });
+      }
+    }
+
+    const user = getUserById(userId);
+    if (!user || user.banned) {
+      return reply.code(403).send({ error: "not allowed" });
+    }
+
+    let displayName = String(body.displayName || "").trim().slice(0, 64);
+    if (!displayName) {
+      try {
+        const ch = getCharacterBySlot(userId, characterSlot);
+        if (ch?.name && !ch.empty) displayName = ch.name;
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!displayName) {
+      displayName = user.username || `Player ${profileId}`;
+    }
+
+    try {
+      const minted = await mintLiveKitAccessToken({
+        profileId,
+        displayName,
+        characterSlot,
+      });
+      const pub = getVoicePublicConfig();
+      return {
+        token: minted.token,
+        identity: minted.identity,
+        room: minted.room,
+        url: pub.url,
+        expiresAt: minted.expiresAt,
+        ranges: pub.ranges,
+        defaultKeybinds: pub.defaultKeybinds,
+      };
+    } catch (e: any) {
+      return reply.code(500).send({
+        error: e?.message || "Failed to mint voice token",
+      });
+    }
+  });
 
   app.get("/v1/news", async (req) => {
     const q = req.query as { limit?: string };
@@ -1223,6 +1327,35 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       sha256,
       downloadUrl: `${config.publicUrl.replace(/\/$/, "")}/v1/client/skymp5-client.js`,
     };
+  });
+
+  /**
+   * In-game proximity voice CEF assets (voice.html / voice-app.js).
+   * Served from DATA_DIR/cdn/voice/ — keep path basename-only (no zip-slip).
+   */
+  app.get("/cdn/voice/:fileName", async (req, reply) => {
+    const fileName = path.basename(String((req.params as { fileName: string }).fileName || ""));
+    if (!fileName || fileName !== String((req.params as { fileName: string }).fileName)) {
+      return reply.code(400).send({ error: "Invalid file name" });
+    }
+    if (!/^[a-zA-Z0-9._-]+$/.test(fileName)) {
+      return reply.code(400).send({ error: "Invalid file name" });
+    }
+    const filePath = path.join(config.dataDir, "cdn", "voice", fileName);
+    if (!fs.existsSync(filePath)) {
+      return reply.code(404).send({ error: "Not found", hint: "Place files under DATA_DIR/cdn/voice/" });
+    }
+    const ext = path.extname(fileName).toLowerCase();
+    const type =
+      ext === ".html"
+        ? "text/html; charset=utf-8"
+        : ext === ".js"
+          ? "application/javascript; charset=utf-8"
+          : ext === ".css"
+            ? "text/css; charset=utf-8"
+            : "application/octet-stream";
+    const stream = fs.createReadStream(filePath);
+    return reply.header("Content-Type", type).send(stream);
   });
 
   /** Stream launcher update artifact (portable .exe or full-app .zip) from data/cdn/launcher/ */

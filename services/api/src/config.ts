@@ -190,6 +190,16 @@ export const config = {
    * Private key is offline-only (VOA_UPDATE_SIGNING_KEY) — never commit it.
    */
   updatePublicKey: (process.env.VOA_UPDATE_PUBLIC_KEY ?? "").trim(),
+
+  /**
+   * Proximity voice (LiveKit). All three required to enable /v1/voice/*.
+   * LIVEKIT_URL must be reachable from players (prefer wss://voice.yourdomain).
+   */
+  livekitUrl: (process.env.LIVEKIT_URL ?? "").trim().replace(/\/$/, ""),
+  livekitApiKey: (process.env.LIVEKIT_API_KEY ?? "").trim(),
+  livekitApiSecret: (process.env.LIVEKIT_API_SECRET ?? "").trim(),
+  livekitRoom: (process.env.LIVEKIT_ROOM ?? "voa-main").trim() || "voa-main",
+  livekitTokenTtlSec: num("LIVEKIT_TOKEN_TTL_SEC", 7200),
 };
 
 export function discordConfigured(): boolean {

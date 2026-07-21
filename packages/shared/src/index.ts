@@ -144,6 +144,44 @@ export const InstalledModSchema = z.object({
 });
 export type InstalledMod = z.infer<typeof InstalledModSchema>;
 
+/** Proximity voice (in-game CEF + LiveKit) — public config */
+export const VoiceRangesSchema = z.object({
+  whisper: z.number(),
+  normal: z.number(),
+  shout: z.number(),
+});
+export type VoiceRanges = z.infer<typeof VoiceRangesSchema>;
+
+export const VoiceKeybindsSchema = z.object({
+  ptt: z.string(),
+  whisper: z.string(),
+  normal: z.string(),
+  shout: z.string(),
+});
+export type VoiceKeybinds = z.infer<typeof VoiceKeybindsSchema>;
+
+export const VoiceConfigSchema = z.object({
+  enabled: z.boolean(),
+  url: z.string(),
+  room: z.string(),
+  ranges: VoiceRangesSchema,
+  defaultKeybinds: VoiceKeybindsSchema,
+  maxBitrate: z.number().optional(),
+  architecture: z.literal("in-game-cef-livekit").optional(),
+});
+export type VoiceConfig = z.infer<typeof VoiceConfigSchema>;
+
+export const VoiceTokenResponseSchema = z.object({
+  token: z.string(),
+  identity: z.string(),
+  room: z.string(),
+  url: z.string(),
+  expiresAt: z.string(),
+  ranges: VoiceRangesSchema,
+  defaultKeybinds: VoiceKeybindsSchema.optional(),
+});
+export type VoiceTokenResponse = z.infer<typeof VoiceTokenResponseSchema>;
+
 export const DEFAULT_SERVER = {
   name: "Visions of Aetherius",
   ip: "178.156.158.116",
