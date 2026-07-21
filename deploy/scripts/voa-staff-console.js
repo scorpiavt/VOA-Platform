@@ -467,27 +467,71 @@ try{
    * Never blindly use getActorsByProfileId()[0] — multi-slot profiles
    * (slot 0 offline + slot 1 online) would hit the wrong character.
    */
+  /**
+   * Refresh live profile→actor map from connected users.
+   * spawnAllowed can miss rebuilds; getUserByActor is flaky under offlineMode.
+   */
+  refreshLiveActorsFromUsers() {
+    if (!this._ctx || !this._ctx.svr) return;
+    const wrap = this._ctx.svr;
+    const raw = rawScamp(this._ctx) || wrap;
+    let maxUsers = 64;
+    try {
+      if (typeof wrap.getMaxPlayers === "function") maxUsers = wrap.getMaxPlayers() || 64;
+      else if (raw && typeof raw.getMaxPlayers === "function")
+        maxUsers = raw.getMaxPlayers() || 64;
+    } catch (eM) {}
+    for (let userId = 0; userId < maxUsers; userId++) {
+      try {
+        let actorId = 0;
+        if (typeof wrap.getUserActor === "function") {
+          actorId = Number(wrap.getUserActor(userId)) || 0;
+        } else if (raw && typeof raw.getUserActor === "function") {
+          actorId = Number(raw.getUserActor(userId)) || 0;
+        }
+        if (!actorId) continue;
+        // Resolve profileId: getUserProfileId / actors list / stored map
+        let profileId = 0;
+        try {
+          if (typeof wrap.getUserProfileId === "function") {
+            profileId = Number(wrap.getUserProfileId(userId)) || 0;
+          } else if (raw && typeof raw.getUserProfileId === "function") {
+            profileId = Number(raw.getUserProfileId(userId)) || 0;
+          }
+        } catch (eP) {}
+        if (!profileId) {
+          // reverse lookup stored
+          for (const pid of Object.keys(this._liveUsers)) {
+            if (Number(this._liveUsers[pid]) === userId) {
+              profileId = Number(pid);
+              break;
+            }
+          }
+        }
+        if (!profileId) continue;
+        this._liveActors[profileId] = actorId;
+        this._liveUsers[profileId] = userId;
+      } catch (eU) {
+        /* skip slot */
+      }
+    }
+  }
+
   actorForProfile(profileId) {
     const pid = Number(profileId) || 0;
     if (!pid || !this._ctx || !this._ctx.svr) return 0;
-    // NativeGameServer has getUserActor/getActorsByProfileId; getUserByActor is raw only
     const wrap = this._ctx.svr;
     const raw = rawScamp(this._ctx) || wrap;
 
-    // 1) Live mapping from spawnAllowed / getUserActor (best)
+    // Opportunistic refresh so poll never stays stuck on empty map
+    try {
+      this.refreshLiveActorsFromUsers();
+    } catch (eR) {}
+
+    // 1) Live mapping from spawnAllowed / user scan — ALWAYS trust if set.
+    // Do NOT discard when getUserByActor is null (common under offlineMode).
     const live = Number(this._liveActors[pid]) || 0;
-    if (live) {
-      try {
-        if (raw && typeof raw.getUserByActor === "function") {
-          const u = raw.getUserByActor(live);
-          if (u != null && u !== undefined && u !== 0 && u !== -1) return live;
-        } else {
-          return live;
-        }
-      } catch (eLive) {
-        return live;
-      }
-    }
+    if (live) return live;
 
     // 2) Among all profile actors, prefer one that still has a connected user
     let actors = [];
@@ -502,9 +546,8 @@ try{
     } catch (eList) {
       actors = [];
     }
-    if (!actors.length) return 0;
 
-    if (raw && typeof raw.getUserByActor === "function") {
+    if (actors.length && raw && typeof raw.getUserByActor === "function") {
       for (let i = 0; i < actors.length; i++) {
         try {
           const u = raw.getUserByActor(actors[i]);
@@ -518,20 +561,25 @@ try{
       }
     }
 
-    // 3) Last resort: highest form id (newer slots tend to be larger), never [0] alone
-    actors.sort((a, b) => (a >>> 0) - (b >>> 0));
-    const fallback = actors[actors.length - 1] || 0;
-    if (fallback) {
-      this.log(
-        "actorForProfile p" +
-          pid +
-          " offline-fallback actor=" +
-          fallback.toString(16) +
-          " n=" +
-          actors.length
-      );
+    // 3) Any profile actor (newest form id) — still better than "wait offline" forever
+    if (actors.length) {
+      actors.sort((a, b) => (a >>> 0) - (b >>> 0));
+      const fallback = actors[actors.length - 1] || 0;
+      if (fallback) {
+        this._liveActors[pid] = fallback;
+        this.log(
+          "actorForProfile p" +
+            pid +
+            " profile-actor fallback=" +
+            fallback.toString(16) +
+            " n=" +
+            actors.length
+        );
+        return fallback;
+      }
     }
-    return fallback;
+
+    return 0;
   }
 
   async pollQueuedActions() {
@@ -574,60 +622,61 @@ try{
             doneIds.push(Number(a.id));
             continue;
           }
-          const actorId = this.actorForProfile(staffProfileId);
-          if (!actorId) {
-            // Keep pending while offline so a reconnect can still receive the cmd
-            this.log("console_cmd wait offline p" + staffProfileId + " " + cmd);
-            try {
-              console.log(
-                "[VOA-staff] console_cmd wait offline p" +
-                  staffProfileId +
-                  " " +
-                  cmd +
-                  " id=" +
-                  a.id
-              );
-            } catch (eW) {}
-            continue;
-          }
-          // Prefer Chakra mp._voaConsole (chat UI results + full announce overlay).
-          // Fallback: self-contained inline JS with chat-queue notify.
+          let actorId = this.actorForProfile(staffProfileId);
           const argsJson = JSON.stringify(Array.isArray(args) ? args : []);
-          let inlineBody = buildConsoleCmdJs(actorId, staffProfileId, cmd, args);
-          if (inlineBody.indexOf("(function(){try{") === 0) {
-            inlineBody = inlineBody
-              .replace(/^\(function\(\)\{try\{/, "")
-              .replace(
-                /\}catch\(eAll\)\{console\.log\('\[VOA-staff\] cmd fail '\+eAll\);\}\}\)\(\);?\s*$/,
-                ""
-              );
-          }
+          const cmdJson = JSON.stringify(String(cmd || "").toLowerCase());
+          const pidNum = Number(staffProfileId) || 0;
+
+          // Resolve actor in Chakra if Node map is empty (offlineMode / reconnect races).
+          // Finds onlinePlayers entry with matching voaProfileId, then runs _voaConsole.
           const finalJs =
             "(function(){try{" +
             "if(typeof mp==='undefined'||!mp){console.log('[VOA-staff] no mp');return;}" +
-            "var actorId=" +
-            Number(actorId) +
-            ",pid=" +
-            Number(staffProfileId) +
+            "var pid=" +
+            pidNum +
+            ",cmd=" +
+            cmdJson +
+            ",argsJson=" +
+            JSON.stringify(argsJson) +
             ";" +
+            "var actorId=" +
+            (Number(actorId) || 0) +
+            ";" +
+            "function findByProfile(p){" +
+            "try{var online=mp.get(0,'onlinePlayers')||[],i,id,pp;" +
+            "for(i=0;i<online.length;i++){id=Number(online[i]);if(!id)continue;" +
+            "try{pp=Number(mp.get(id,'voaProfileId'))||0;}catch(e0){pp=0;}" +
+            "if(pp===p)return id;}" +
+            "}catch(eF){}return 0;}" +
+            "if(!actorId)actorId=findByProfile(pid);" +
+            "if(!actorId){console.log('[VOA-staff] no online actor for p'+pid+' cmd='+cmd);return;}" +
             "try{mp.set(actorId,'voaStaff',true);}catch(eS){}" +
             "try{mp.set(actorId,'voaProfileId',pid);}catch(eP){}" +
             "if(typeof mp._voaConsole==='function'){" +
-            "mp._voaConsole(actorId,pid," +
-            JSON.stringify(String(cmd || "").toLowerCase()) +
-            "," +
-            JSON.stringify(argsJson) +
-            ");" +
-            "console.log('[VOA-staff] via _voaConsole " +
-            escapeJsString(cmd) +
-            " actor=" +
-            Number(actorId).toString(16) +
-            "');" +
+            "mp._voaConsole(actorId,pid,cmd,argsJson);" +
+            "console.log('[VOA-staff] via _voaConsole '+cmd+' actor='+actorId.toString(16)+' p'+pid);" +
             "}else{" +
-            "console.log('[VOA-staff] inline fallback " +
-            escapeJsString(cmd) +
-            "');" +
-            inlineBody +
+            "console.log('[VOA-staff] _voaConsole missing p'+pid+' actor='+actorId.toString(16));" +
+            // Minimal listplayers/announce without full inline builder
+            "function pushEval(id,code){try{var prev=null;try{prev=mp.get(id,'eval');}catch(eE){}" +
+            "var n=prev&&typeof prev.n==='number'?prev.n+1:1;mp.set(id,'eval',{n:n,f:String(code||'')});}catch(eN){}}" +
+            "function notify(id,text){var line={channel:'sys',name:'System',text:String(text||''),fromId:0,system:true};" +
+            "var js='(function(){try{var line='+JSON.stringify(line)+';var raw=ctx.sp.storage[\"voaChatQueueJson\"];var q=[];'+" +
+            "try{if(typeof raw===\"string\"&&raw.length)q=JSON.parse(raw);}catch(e0){q=[];}if(!q||!q.length)q=[];q.push(line);if(q.length>80)q=q.slice(-80);'+" +
+            "ctx.sp.storage[\"voaChatQueueJson\"]=JSON.stringify(q);try{ctx.sp.Debug.notification(line.text.slice(0,120));}catch(e3){}}catch(e){}})()';" +
+            "pushEval(id,js);}" +
+            "if(cmd==='listplayers'||cmd==='players'){" +
+            "var o=mp.get(0,'onlinePlayers')||[],lines=[],j;" +
+            "for(j=0;j<o.length;j++){var oid=Number(o[j]);var nm='?';try{var a=mp.get(oid,'appearance');if(a&&a.name)nm=a.name;}catch(eN){}" +
+            "try{var cn=mp.get(oid,'voaCharName');if(cn)nm=cn;}catch(eC){}lines.push(nm+' ['+oid.toString(16)+']');}" +
+            "notify(actorId,o.length?('Online ('+o.length+'): '+lines.join(', ')):'No players online');" +
+            "}else if(cmd==='announce'||cmd==='a'){" +
+            "var msgA='';try{var ar=JSON.parse(argsJson);if(ar&&ar.length)msgA=ar.join(' ');}catch(eA){}" +
+            "if(!msgA){notify(actorId,'Usage: /announce <message>');return;}" +
+            "if(typeof mp._voaAnnounceAll==='function'){mp._voaAnnounceAll(msgA,'Staff');}" +
+            "else{var oa=mp.get(0,'onlinePlayers')||[],k;for(k=0;k<oa.length;k++)notify(Number(oa[k]),'[ANNOUNCE] '+msgA);}" +
+            "notify(actorId,'Announcement sent');" +
+            "}else{notify(actorId,'Admin cmd needs full console handler: '+cmd);}" +
             "}" +
             "}catch(eAll){console.log('[VOA-staff] cmd fail '+eAll);}})();";
 
@@ -636,7 +685,7 @@ try{
               "console_cmd HTTP p" +
                 staffProfileId +
                 " actor=" +
-                actorId.toString(16) +
+                (actorId ? actorId.toString(16) : "chakra-resolve") +
                 " " +
                 cmd
             );
@@ -645,13 +694,16 @@ try{
                 "[VOA-staff] console_cmd HTTP p" +
                   staffProfileId +
                   " actor=" +
-                  actorId.toString(16) +
+                  (actorId ? actorId.toString(16) : "chakra-resolve") +
                   " " +
                   cmd +
                   " id=" +
                   a.id
               );
             } catch (eL) {}
+            // Ack even if actor was resolved only in Chakra — otherwise queue stuck.
+            // If truly offline, Chakra logs "no online actor" and user can re-issue.
+            doneIds.push(Number(a.id));
           } else {
             try {
               console.log(
@@ -659,9 +711,8 @@ try{
                   cmd
               );
             } catch (eM) {}
-            continue;
+            // do not ack
           }
-          doneIds.push(Number(a.id));
           continue;
         }
 
