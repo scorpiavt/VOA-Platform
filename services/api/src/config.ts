@@ -92,9 +92,20 @@ function resolvePublicUrl(): string {
   }
   if (!isLocalHostname(u.hostname)) {
     if (u.protocol !== "https:") {
-      throw new Error(
-        `[VOA compliance] PUBLIC_URL must use HTTPS for non-local hosts (got ${u.protocol}//${u.hostname}). ` +
-          `Terminate TLS with Caddy/nginx. See docs/NEXUS_COMPLIANCE.md §3.`
+      // Transitional: live players may still hit IP:3100 until TLS is provisioned.
+      // Set VOA_ALLOW_INSECURE_PUBLIC_HTTP=true explicitly — never the default.
+      const allowHttp =
+        (process.env.VOA_ALLOW_INSECURE_PUBLIC_HTTP || "").toLowerCase() ===
+        "true";
+      if (!allowHttp) {
+        throw new Error(
+          `[VOA compliance] PUBLIC_URL must use HTTPS for non-local hosts (got ${u.protocol}//${u.hostname}). ` +
+            `Terminate TLS with Caddy/nginx, or set VOA_ALLOW_INSECURE_PUBLIC_HTTP=true only while migrating. ` +
+            `See docs/NEXUS_COMPLIANCE.md §3.`
+        );
+      }
+      console.warn(
+        `[VOA compliance] WARNING: PUBLIC_URL is HTTP (${raw}). Set HTTPS when TLS is ready.`
       );
     }
   }
@@ -107,8 +118,16 @@ function resolveCdnBaseUrl(publicUrl: string): string {
   try {
     const u = new URL(raw);
     if (!isLocalHostname(u.hostname) && u.protocol !== "https:") {
-      throw new Error(
-        `[VOA compliance] CDN_BASE_URL must use HTTPS for non-local hosts. See docs/NEXUS_COMPLIANCE.md §3.`
+      const allowHttp =
+        (process.env.VOA_ALLOW_INSECURE_PUBLIC_HTTP || "").toLowerCase() ===
+        "true";
+      if (!allowHttp) {
+        throw new Error(
+          `[VOA compliance] CDN_BASE_URL must use HTTPS for non-local hosts. See docs/NEXUS_COMPLIANCE.md §3.`
+        );
+      }
+      console.warn(
+        `[VOA compliance] WARNING: CDN_BASE_URL is HTTP (${raw}). Set HTTPS when TLS is ready.`
       );
     }
   } catch (e) {
