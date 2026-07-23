@@ -224,30 +224,75 @@ function applyPos(ctx, actorId, binding, log) {
     const pos = binding.pos;
     const ang =
       typeof binding.angleZ === "number" ? Number(binding.angleZ) : 0;
-    // worldOrCellDesc as form id number — scamp may want desc string; try both via mp
     const cell = Number(binding.worldOrCell) || 0;
+    if (!cell || !Array.isArray(pos) || pos.length < 3) return;
+    // Prefer numeric worldOrCell / worldOrCellDesc; string form for builds that want hex
     const js =
       "try{if(typeof mp!=='undefined'&&mp){" +
       "var id=" +
       Number(actorId) +
       ";" +
-      "try{mp.set(id,'worldOrCellDesc',String(" +
+      "var cell=" +
       cell +
-      "));}catch(eW){}" +
-      "try{mp.set(id,'pos',[" +
+      ";" +
+      "var pos=[" +
       Number(pos[0]) +
       "," +
       Number(pos[1]) +
       "," +
       Number(pos[2]) +
-      "]);}catch(eP){}" +
-      "try{mp.set(id,'angle',[0,0," +
+      "];" +
+      "var ang=" +
       ang +
-      "]);}catch(eA){}" +
-      "}}catch(e){}";
+      ";" +
+      "try{mp.set(id,'worldOrCell',cell);}catch(e0){}" +
+      "try{mp.set(id,'worldOrCellDesc',cell);}catch(e1){}" +
+      "try{mp.set(id,'worldOrCellDesc','0x'+cell.toString(16));}catch(e2){}" +
+      "try{mp.set(id,'pos',pos);}catch(eP){}" +
+      "try{mp.set(id,'angle',[0,0,ang]);}catch(eA){}" +
+      "console.log('[VOA-spawn] applyPos '+id.toString(16)+' cell=0x'+cell.toString(16)+' pos='+pos.join(','));" +
+      "}}catch(e){console.log('[VOA-spawn] applyPos fail '+e);}";
     runChakra(ctx, js);
+    // Re-apply after client loadGame settles (otherwise startPoints wins)
+    const aid = Number(actorId);
+    const self = { ctx, binding, log };
+    setTimeout(function () {
+      applyPosOnce(self.ctx, aid, self.binding, self.log);
+    }, 1200);
+    setTimeout(function () {
+      applyPosOnce(self.ctx, aid, self.binding, self.log);
+    }, 3500);
   } catch (e) {
     if (log) log("VOA: pos apply err " + e);
+  }
+}
+
+function applyPosOnce(ctx, actorId, binding, log) {
+  if (!binding || !binding.pos || !binding.worldOrCell) return;
+  try {
+    const pos = binding.pos;
+    const ang =
+      typeof binding.angleZ === "number" ? Number(binding.angleZ) : 0;
+    const cell = Number(binding.worldOrCell) || 0;
+    const js =
+      "try{if(typeof mp!=='undefined'&&mp){var id=" +
+      Number(actorId) +
+      ";var cell=" +
+      cell +
+      ";var pos=[" +
+      Number(pos[0]) +
+      "," +
+      Number(pos[1]) +
+      "," +
+      Number(pos[2]) +
+      "];try{mp.set(id,'worldOrCell',cell);}catch(e0){}try{mp.set(id,'worldOrCellDesc',cell);}catch(e1){}" +
+      "try{mp.set(id,'pos',pos);}catch(eP){}try{mp.set(id,'angle',[0,0," +
+      ang +
+      "]);}catch(eA){}" +
+      "console.log('[VOA-spawn] re-applyPos '+id.toString(16));}}catch(e){}";
+    runChakra(ctx, js);
+  } catch (e) {
+    if (log) log("VOA: re-applyPos err " + e);
   }
 }
 
@@ -270,10 +315,13 @@ class Spawn {
   constructor(log) {
     this.log = log;
     this.systemName = "Spawn";
+    /** userId -> { profileId, slot, actorId } for disconnect saves */
+    this._live = Object.create(null);
   }
 
   initAsync(ctx) {
     return __awaiter(this, void 0, void 0, function* () {
+      this._ctx = ctx;
       ctx.gm.on("spawnAllowed", (userId, userProfileId, characterSlot) => {
         // async path — never throw into scamp
         this.spawnPlayer(ctx, userId, userProfileId, characterSlot).catch(
@@ -317,12 +365,22 @@ class Spawn {
         .filter(Boolean);
       const ordered = actors.slice().sort((a, b) => (a >>> 0) - (b >>> 0));
 
-      const want =
+      let want =
         binding && binding.actorFormId ? Number(binding.actorFormId) : 0;
+      // Local PC form 0x14 is never a valid multiplayer hardlink
+      if (want > 0 && want < 0xff000000) {
+        this.log(
+          "VOA: rejecting invalid hardlink",
+          want.toString(16),
+          "(local form) profile",
+          profileId
+        );
+        want = 0;
+      }
       let actorId = 0;
       let isNew = false;
 
-      if (want > 0 && actors.indexOf(want) >= 0) {
+      if (want >= 0xff000000 && actors.indexOf(want) >= 0) {
         actorId = want;
         this.log(
           "Loading HARD-LINKED character",
@@ -332,7 +390,7 @@ class Spawn {
           "slot",
           slot
         );
-      } else if (want > 0) {
+      } else if (want >= 0xff000000) {
         this.log(
           "VOA: hardlink actor missing from world",
           want.toString(16),
@@ -366,14 +424,35 @@ class Spawn {
       const empty = !binding || binding.empty === true;
       const hasApp = hasValidAppearance(binding && binding.appearance);
 
-      // 2) Create if needed
+      // 2) Create if needed — use last saved pos/cell when available (not always Riverwood start)
       if (!actorId) {
         const idx = randomInteger(0, Math.max(0, startPoints.length - 1));
-        const sp = startPoints[idx] || {
+        const def = startPoints[idx] || {
           pos: [0, 0, 0],
           angleZ: 0,
           worldOrCell: 0x3c,
         };
+        const hasSavedPos =
+          binding &&
+          Array.isArray(binding.pos) &&
+          binding.pos.length >= 3 &&
+          Number(binding.worldOrCell) > 0;
+        const sp = hasSavedPos
+          ? {
+              pos: [
+                Number(binding.pos[0]),
+                Number(binding.pos[1]),
+                Number(binding.pos[2]),
+              ],
+              angleZ:
+                typeof binding.angleZ === "number" ? Number(binding.angleZ) : 0,
+              worldOrCell: Number(binding.worldOrCell),
+            }
+          : {
+              pos: def.pos,
+              angleZ: def.angleZ || 0,
+              worldOrCell: +def.worldOrCell || 0x3c,
+            };
         actorId = ctx.svr.createActor(
           0,
           sp.pos,
@@ -389,7 +468,8 @@ class Spawn {
           profileId,
           "slot",
           slot,
-          hasApp ? "(will restore look from DB)" : "(race menu)"
+          hasSavedPos ? "at SAVED pos" : "at DEFAULT start",
+          hasApp ? "(look from DB)" : "(race menu)"
         );
       } else {
         try {
@@ -495,9 +575,16 @@ class Spawn {
         setTimeout(() => starterKit(ctx, aid), 12000);
       }
 
+      // Track for disconnect save
+      this._live[Number(userId)] = {
+        profileId,
+        slot,
+        actorId: Number(actorId),
+      };
+
       // 9) Persist hardlink only — do NOT re-post appearance/name here
       // (was overwriting good names like Paarthurnax with stale "Prisoner" from look dump)
-      if (SECRET && !empty) {
+      if (SECRET && !empty && Number(actorId) >= 0xff000000) {
         try {
           yield httpJson("POST", "/v1/game/character-state", {
             profileId,
@@ -513,8 +600,61 @@ class Spawn {
   }
 
   disconnect(userId, ctx) {
-    const actorId = ctx.svr.getUserActor(userId);
-    if (actorId !== 0) ctx.svr.setEnabled(actorId, false);
+    const uid = Number(userId);
+    const live = this._live[uid];
+    const actorId = ctx.svr.getUserActor(userId) || (live && live.actorId) || 0;
+    // Best-effort position snapshot before disable (fixes "always Riverwood" after logout)
+    if (SECRET && live && live.profileId && actorId >= 0xff000000) {
+      try {
+        const js =
+          "try{if(typeof mp!=='undefined'&&mp){" +
+          "var id=" +
+          Number(actorId) +
+          ";" +
+          "var pos=null,ang=0,cell=0;" +
+          "try{pos=mp.get(id,'pos');}catch(e0){}" +
+          "try{var a=mp.get(id,'angle');if(a&&a.length>=3)ang=Number(a[2])||0;}catch(e1){}" +
+          "try{var w=mp.get(id,'worldOrCell');if(typeof w==='number')cell=w;" +
+          "else{w=mp.get(id,'worldOrCellDesc');if(typeof w==='number')cell=w;else if(w){var n=parseInt(String(w),0);if(n)cell=n;}}}catch(e2){}" +
+          "if(pos&&pos.length>=3&&cell){" +
+          "console.log('[VOA-spawn] disconnect-save ready '+id.toString(16)+' cell=0x'+cell.toString(16));" +
+          "mp.set(0,'_voaDiscSave',{profileId:" +
+          Number(live.profileId) +
+          ",slot:" +
+          Number(live.slot) +
+          ",actorFormId:id,pos:[Number(pos[0]),Number(pos[1]),Number(pos[2])],angleZ:ang,worldOrCell:cell});" +
+          "}else{console.log('[VOA-spawn] disconnect-save skip '+id.toString(16)+' pos='+!!pos+' cell='+cell);}" +
+          "}}catch(e){console.log('[VOA-spawn] disconnect-save err '+e);}";
+        runChakra(ctx, js);
+        // Pull snapshot via mp property if available, else read pos through scamp if any
+        try {
+          // Fire-and-forget HTTP from Node after a short delay so Chakra set completes
+          const profileId = live.profileId;
+          const slot = live.slot;
+          const aid = Number(actorId);
+          setTimeout(() => {
+            try {
+              // Re-read via Chakra into a one-shot log; primary path is client reportCharacterState.
+              // Also try native: no getPos on wrapper — client interval remains primary.
+              httpJson("POST", "/v1/game/character-state", {
+                profileId,
+                slot,
+                actorFormId: aid,
+                reason: "disconnect-hardlink",
+              }).catch(() => {});
+            } catch (eH) {}
+          }, 50);
+        } catch (eS) {}
+      } catch (eDisc) {
+        this.log("VOA: disconnect save err " + eDisc);
+      }
+    }
+    delete this._live[uid];
+    if (actorId !== 0) {
+      try {
+        ctx.svr.setEnabled(actorId, false);
+      } catch (eEn) {}
+    }
   }
 }
 exports.Spawn = Spawn;

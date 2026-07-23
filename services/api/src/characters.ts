@@ -369,8 +369,11 @@ export function bindCharacterActor(
   if (slot < 0 || slot > 1) {
     throw Object.assign(new Error("Invalid slot"), { statusCode: 400 });
   }
-  if (!(actorFormId > 0)) {
-    throw Object.assign(new Error("actorFormId required"), { statusCode: 400 });
+  if (!(actorFormId >= 0xff000000)) {
+    throw Object.assign(
+      new Error("actorFormId must be a multiplayer actor (0xff******), not local 0x14"),
+      { statusCode: 400 }
+    );
   }
   const user = getDb()
     .prepare(`SELECT id FROM users WHERE profile_id = ?`)
@@ -445,7 +448,11 @@ export function saveCharacterState(
       : row.name;
 
   let actorFormId = row.actor_form_id;
-  if (typeof state.actorFormId === "number" && state.actorFormId > 0) {
+  // Multiplayer actors are always 0xff****** — never accept local PC form 0x14 (20)
+  if (
+    typeof state.actorFormId === "number" &&
+    state.actorFormId >= 0xff000000
+  ) {
     actorFormId = state.actorFormId;
   }
 

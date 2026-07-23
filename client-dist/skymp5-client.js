@@ -6704,6 +6704,10 @@ System.register("skymp5-client/src/front/skympClient", ["build/dist/client/Data/
                         }
                         catch (eAf2) { /* ignore */ }
                     }
+                    // Never report local PC form 0x14 as multiplayer hardlink
+                    if (actorFormId > 0 && actorFormId < 0xff000000) {
+                        actorFormId = 0;
+                    }
                     var name = "";
                     var appearance = null;
                     var equipment = null;
