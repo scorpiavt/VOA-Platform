@@ -123,16 +123,32 @@ function isLocalApiBase(base: string = API_BASE): boolean {
   }
 }
 
+/** Persistent agents — reuse TCP to VPS for character/session traffic (much faster than new connect per call). */
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 8,
+  maxFreeSockets: 4,
+});
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30_000,
+  maxSockets: 8,
+  maxFreeSockets: 4,
+});
+
 /** Node-side HTTP JSON (avoids Chromium renderer network / localhost IPv6 issues) */
 function apiRequest<T = unknown>(
   method: string,
   pathname: string,
-  opts?: { token?: string; body?: unknown }
+  opts?: { token?: string; body?: unknown; timeoutMs?: number }
 ): Promise<{ ok: boolean; status: number; data: T; raw: string }> {
   return new Promise((resolve, reject) => {
     const url = new URL(pathname, API_BASE);
     const lib = url.protocol === "https:" ? https : http;
+    const agent = url.protocol === "https:" ? httpsAgent : httpAgent;
     const bodyStr = opts?.body !== undefined ? JSON.stringify(opts.body) : undefined;
+    const timeoutMs = opts?.timeoutMs ?? 8000;
     const req = lib.request(
       {
         protocol: url.protocol,
@@ -140,14 +156,16 @@ function apiRequest<T = unknown>(
         port: url.port,
         path: url.pathname + url.search,
         method,
+        agent,
         headers: {
           Accept: "application/json",
+          Connection: "keep-alive",
           ...(bodyStr
             ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(bodyStr) }
             : {}),
           ...(opts?.token ? { Authorization: `Bearer ${opts.token}` } : {}),
         },
-        timeout: 8000,
+        timeout: timeoutMs,
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -2891,11 +2909,13 @@ ipcMain.handle("voa:getCharacters", async () => {
   try {
     const store = readStore();
     if (!store.accessToken) return { error: "Not logged in", characters: [] };
+    // Single round-trip to VPS character DB (no status merge / no N PATCHes).
+    // In-game look.name already persists via POST /v1/game/character-name.
     const res = await apiRequest<{ characters: unknown[] }>("GET", "/v1/characters", {
       token: store.accessToken,
     });
     if (!res.ok) return { error: res.raw || `characters ${res.status}`, characters: [] };
-    let characters = ((res.data as any)?.characters ?? []) as Array<{
+    const characters = ((res.data as any)?.characters ?? []) as Array<{
       id: number;
       slot: number;
       name: string;
@@ -2903,46 +2923,6 @@ ipcMain.handle("voa:getCharacters", async () => {
       lastPlayedAt?: string | null;
       createdAt: string;
     }>;
-
-    // Merge in-game names from status (race menu / look sync)
-    try {
-      const profileId = (store.user as any)?.profileId;
-      const st = await apiRequest("GET", "/v1/status");
-      const namesRoot = (st.data as any)?.characterNames;
-      const bySlot =
-        profileId != null && namesRoot
-          ? namesRoot[String(profileId)] || namesRoot[profileId]
-          : null;
-      if (bySlot && typeof bySlot === "object") {
-        characters = await Promise.all(
-          characters.map(async (ch) => {
-            const gameName = bySlot[String(ch.slot)] || bySlot[ch.slot];
-            if (
-              !ch.empty &&
-              typeof gameName === "string" &&
-              gameName.trim() &&
-              gameName.trim() !== ch.name
-            ) {
-              const nm = gameName.trim().slice(0, 48);
-              // Persist to API so UI stays correct offline of status
-              try {
-                await apiRequest("PATCH", `/v1/characters/slot/${ch.slot}`, {
-                  token: store.accessToken!,
-                  body: { name: nm },
-                });
-              } catch {
-                /* ignore */
-              }
-              return { ...ch, name: nm, empty: false };
-            }
-            return ch;
-          })
-        );
-      }
-    } catch {
-      /* status optional */
-    }
-
     return { characters };
   } catch (e: any) {
     return { error: e?.message || String(e), characters: [] };

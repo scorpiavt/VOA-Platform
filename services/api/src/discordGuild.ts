@@ -154,6 +154,10 @@ export async function assertCommunityMemberAtLogin(
   return { ok: true, method: "oauth_guilds" };
 }
 
+/** Positive guild membership cache for Play/session mint (Discord is slow). */
+const ongoingGuildCache = new Map<string, { at: number; ok: boolean; reason?: string }>();
+const ONGOING_GUILD_CACHE_MS = 120_000; // 2 minutes
+
 /** Re-check at Play / token refresh */
 export async function assertCommunityMemberOngoing(
   discordUserId: string
@@ -168,10 +172,28 @@ export async function assertCommunityMemberOngoing(
     };
   }
   // Ongoing checks use bot when available; without bot we only gated at login
-  if (config.discordBotToken) {
-    return userInGuildViaBot(discordUserId);
+  if (!config.discordBotToken) {
+    return { ok: true, method: "skipped" };
   }
-  return { ok: true, method: "skipped" };
+
+  const id = String(discordUserId);
+  const hit = ongoingGuildCache.get(id);
+  if (hit && Date.now() - hit.at < ONGOING_GUILD_CACHE_MS) {
+    if (hit.ok) return { ok: true, method: "bot_member" };
+    return {
+      ok: false,
+      reason: hit.reason || "Not a community member.",
+      inviteUrl: inviteHint(),
+    };
+  }
+
+  const result = await userInGuildViaBot(discordUserId);
+  ongoingGuildCache.set(id, {
+    at: Date.now(),
+    ok: result.ok,
+    reason: result.ok ? undefined : result.reason,
+  });
+  return result;
 }
 
 export function membershipErrorHtml(result: Extract<GuildCheckResult, { ok: false }>): {

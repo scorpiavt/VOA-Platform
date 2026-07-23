@@ -37,8 +37,14 @@ export function initDb(): void {
   fs.mkdirSync(config.dataDir, { recursive: true });
   const dbPath = path.join(config.dataDir, "voa.db");
   db = new DatabaseSync(dbPath);
+  // Character DB is hot-path for launcher list + play session mint + in-game saves.
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
+  db.exec("PRAGMA busy_timeout = 5000;");
+  db.exec("PRAGMA synchronous = NORMAL;");
+  db.exec("PRAGMA temp_store = MEMORY;");
+  db.exec("PRAGMA cache_size = -16000;"); // ~16MB page cache
+  db.exec("PRAGMA mmap_size = 67108864;"); // 64MB mmap when OS allows
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
@@ -218,6 +224,30 @@ export function initDb(): void {
   if (!userCols.includes("staff_checked_at")) {
     db.exec(`ALTER TABLE users ADD COLUMN staff_checked_at TEXT`);
   }
+
+  // game_sessions: store character slot on the row (avoid meta-table round trip)
+  const sessionCols = (
+    db.prepare(`PRAGMA table_info(game_sessions)`).all() as { name: string }[]
+  ).map((c) => c.name);
+  if (!sessionCols.includes("character_slot")) {
+    db.exec(
+      `ALTER TABLE game_sessions ADD COLUMN character_slot INTEGER NOT NULL DEFAULT 0`
+    );
+  }
+
+  // Hot indexes for launcher character list + session auth + binding by profile
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_characters_user_active
+      ON characters(user_id, deleted, slot);
+    CREATE INDEX IF NOT EXISTS idx_characters_profile_actor
+      ON characters(actor_form_id) WHERE actor_form_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_game_sessions_expires
+      ON game_sessions(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_game_sessions_user
+      ON game_sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_users_profile
+      ON users(profile_id);
+  `);
 
   // Support log metadata (files live under data/support-logs/, not public CDN)
   db.exec(`

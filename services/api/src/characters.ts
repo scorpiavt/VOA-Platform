@@ -98,27 +98,25 @@ function clearWorldStateSql(): string {
 export function ensureCharacterSlots(userId: number): void {
   const db = getDb();
   const now = new Date().toISOString();
+  // One query for both slots instead of 2–4 round trips
+  const rows = db
+    .prepare(
+      `SELECT id, slot, deleted FROM characters WHERE user_id = ? AND slot IN (0, 1)`
+    )
+    .all(userId) as Array<{ id: number; slot: number; deleted: number }>;
+  const bySlot = new Map(rows.map((r) => [r.slot, r]));
   for (let slot = 0; slot < MAX_SLOTS; slot++) {
-    const existing = db
-      .prepare(
-        `SELECT id FROM characters WHERE user_id = ? AND slot = ? AND deleted = 0`
-      )
-      .get(userId, slot) as { id: number } | undefined;
-    if (!existing) {
-      const any = db
-        .prepare(`SELECT id, deleted FROM characters WHERE user_id = ? AND slot = ?`)
-        .get(userId, slot) as { id: number; deleted: number } | undefined;
-      if (any && any.deleted) {
-        db.prepare(
-          `UPDATE characters SET deleted = 0, empty = 1, name = 'Empty Slot',
-           last_played_at = NULL, ${clearWorldStateSql()}, updated_at = ? WHERE id = ?`
-        ).run(now, any.id);
-      } else if (!any) {
-        db.prepare(
-          `INSERT INTO characters (user_id, slot, name, empty, deleted, created_at, updated_at)
-           VALUES (?, ?, 'Empty Slot', 1, 0, ?, ?)`
-        ).run(userId, slot, now, now);
-      }
+    const any = bySlot.get(slot);
+    if (!any) {
+      db.prepare(
+        `INSERT INTO characters (user_id, slot, name, empty, deleted, created_at, updated_at)
+         VALUES (?, ?, 'Empty Slot', 1, 0, ?, ?)`
+      ).run(userId, slot, now, now);
+    } else if (any.deleted) {
+      db.prepare(
+        `UPDATE characters SET deleted = 0, empty = 1, name = 'Empty Slot',
+         last_played_at = NULL, ${clearWorldStateSql()}, updated_at = ? WHERE id = ?`
+      ).run(now, any.id);
     }
   }
 }

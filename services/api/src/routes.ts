@@ -583,20 +583,20 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
     const session = nanoid(32);
     const expiresAt = new Date(Date.now() + config.sessionTtlSec * 1000).toISOString();
+    const createdAt = new Date().toISOString();
     getDb()
       .prepare(
-        `INSERT INTO game_sessions (session_id, user_id, profile_id, expires_at, created_at)
-         VALUES (?, ?, ?, ?, ?)`
+        `INSERT INTO game_sessions (session_id, user_id, profile_id, expires_at, created_at, character_slot)
+         VALUES (?, ?, ?, ?, ?, ?)`
       )
-      .run(session, user.id, user.profile_id, expiresAt, new Date().toISOString());
+      .run(session, user.id, user.profile_id, expiresAt, createdAt, characterSlot);
 
-    // Store slot on session row via side table meta key (lightweight)
+    // Keep meta key for older game-server / client readers (cheap, same transaction path)
     getDb()
-      .prepare(
-        `INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`
-      )
+      .prepare(`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`)
       .run(`session_slot:${session}`, String(characterSlot));
 
+    // Single response includes character so launcher need not re-GET /v1/characters on Play
     return {
       session,
       profileId: user.profile_id,
@@ -605,6 +605,16 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       serverPort: config.gameServerPort,
       master: config.publicUrl,
       characterSlot,
+      character: {
+        id: ch.id,
+        slot: ch.slot,
+        name: ch.name,
+        empty: Boolean(ch.empty),
+        lastPlayedAt: ch.last_played_at,
+        hasWorldActor: Boolean(
+          ch.actor_form_id != null && Number(ch.actor_form_id) > 0
+        ),
+      },
     };
   });
 
@@ -939,7 +949,12 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
 
   app.get("/v1/characters", async (req) => {
     const user = await requireUser(req);
-    return { characters: listCharacters(user.id), maxSlots: 2 };
+    // Lightweight list for launcher UI — SQLite indexed by user_id
+    return {
+      characters: listCharacters(user.id),
+      maxSlots: 2,
+      profileId: user.profile_id,
+    };
   });
 
   app.post("/v1/characters", async (req, reply) => {
@@ -1050,10 +1065,12 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
   function sessionRow(session: string) {
     return getDb()
       .prepare(
-        `SELECT user_id, profile_id FROM game_sessions
+        `SELECT user_id, profile_id, character_slot FROM game_sessions
          WHERE session_id = ? AND datetime(expires_at) > datetime('now')`
       )
-      .get(session) as { user_id: number; profile_id: number } | undefined;
+      .get(session) as
+      | { user_id: number; profile_id: number; character_slot?: number }
+      | undefined;
   }
 
   /**
@@ -1081,10 +1098,14 @@ export async function registerRoutes(app: FastifyInstance): Promise<void> {
       profileId = row.profile_id;
       authed = true;
       if (!(slot >= 0 && slot <= 1)) {
-        const meta = getDb()
-          .prepare(`SELECT value FROM meta WHERE key = ?`)
-          .get(`session_slot:${q.session}`) as { value: string } | undefined;
-        slot = meta ? Number(meta.value) : 0;
+        if (typeof row.character_slot === "number") {
+          slot = row.character_slot;
+        } else {
+          const meta = getDb()
+            .prepare(`SELECT value FROM meta WHERE key = ?`)
+            .get(`session_slot:${q.session}`) as { value: string } | undefined;
+          slot = meta ? Number(meta.value) : 0;
+        }
       }
     }
     if (!authed) {
