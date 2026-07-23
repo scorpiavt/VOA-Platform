@@ -445,13 +445,21 @@ try{
         if(b===0x3eadd||b===0x3eae0||b===0x3eae5) potions+=c;
       }
     }
-    // Classic vanilla chargen dump: several iron pieces + gold + potions, modest bag size
-    var classicStarter = ironPieces>=2 && gold>=10 && n>=8 && n<=30;
-    if(race || classicStarter){
+    // Vanilla chargen iron kit (with or without gold/potions). Also pure iron armor set.
+    var classicStarter = ironPieces>=2 && gold>=10 && n>=6 && n<=30;
+    var ironArmorOnly = ironPieces>=3 && n<=12 && gold<=0;
+    var hasRags=false;
+    if(inv&&inv.entries){
+      for(var r=0;r<inv.entries.length;r++){
+        var rb=Number(inv.entries[r].baseId);
+        if(rb===ROBES||rb===BOOTS){hasRags=true;break;}
+      }
+    }
+    if(race || classicStarter || (ironArmorOnly && !hasRags)){
       try{mp.set(id,'inventory',{entries:entries});}catch(eS){}
       try{mp.set(id,'equipment',{inv:{entries:entries},numChanges:1});}catch(eE){}
       if(typeof mp._voaStarterKit==='function'){try{mp._voaStarterKit(id);}catch(eK){}}
-      console.log('[VOA-starter] enforce '+id.toString(16)+' race='+race+' classic='+classicStarter+' n='+n);
+      console.log('[VOA-starter] enforce '+id.toString(16)+' race='+race+' classic='+classicStarter+' ironOnly='+ironArmorOnly+' n='+n);
     }
   }
 }catch(eAll){console.log('[VOA-starter] enforce err '+eAll);}
